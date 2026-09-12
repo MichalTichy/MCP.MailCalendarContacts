@@ -20,7 +20,7 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \
-        /p:UseAppHost=false
+        /p:UseAppHost=true
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0.9-noble
 WORKDIR /app
@@ -30,6 +30,7 @@ RUN groupadd --system adjutant \
     && chown -R adjutant:adjutant /app
 COPY --from=build --chown=adjutant:adjutant /app/publish .
 COPY --from=build /source/LICENSE /licenses/adjutant-LICENSE
+RUN chmod 0555 /app/CalendarMcp.HttpServer
 
 ENV ASPNETCORE_URLS=http://+:8080 \
     CALENDAR_MCP_CONFIG=/app/data
@@ -37,4 +38,4 @@ ENV ASPNETCORE_URLS=http://+:8080 \
 VOLUME ["/app/data"]
 EXPOSE 8080
 USER adjutant
-ENTRYPOINT ["dotnet", "CalendarMcp.HttpServer.dll"]
+ENTRYPOINT ["/app/CalendarMcp.HttpServer"]
