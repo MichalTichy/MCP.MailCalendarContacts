@@ -11,7 +11,9 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
 - New accounts default to calendar read-only.
 - Mail, contacts, calendar writes, and outbound email require explicit account-level permission.
 - Microsoft and Google OAuth scopes are derived from the enabled account capabilities.
-- The container runs as a non-root user with `no-new-privileges`.
+- The container runs as a dedicated non-root user. Compose deliberately avoids
+  `no-new-privileges` because some supported Docker hosts reject .NET process
+  execution when that option is applied.
 - Account configuration, OAuth caches, and protected IMAP/SMTP credentials remain in a dedicated volume.
 - The UI binds to loopback by default, and the container joins the gateway backend network rather than its runner network.
 
