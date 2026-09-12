@@ -6,7 +6,8 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
 
 ## Security defaults
 
-- The MCP endpoint requires its own API key.
+- The MCP endpoint is confined to the trusted private network and does not use
+  transport-level API-key authentication.
 - The management UI uses a different administrator token.
 - New accounts default to calendar read-only.
 - Mail, contacts, calendar writes, and outbound email require explicit account-level permission.
@@ -17,7 +18,7 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
 - Account configuration, OAuth caches, and protected IMAP/SMTP credentials remain in a dedicated volume.
 - The UI binds to loopback by default, and the container joins the gateway backend network rather than its runner network.
 
-Codex Gateway provides the second authorization layer: each API key/project grant selects exact MCP tools, and its run-scoped relay rejects calls to tools outside that selection.
+Codex Gateway provides the tool-authorization layer: each API key/project grant selects exact MCP tools, and its run-scoped relay rejects calls to tools outside that selection.
 
 ## Start the server
 
@@ -27,7 +28,7 @@ The Compose deployment expects the external `codex-gateway-backend` network crea
 docker network create codex-gateway-backend
 ```
 
-Copy `.env.example` to `.env`, replace both tokens with different random values, sign in to `registry.tichymichal.net`, and start the published image:
+Copy `.env.example` to `.env`, replace the administrator token, sign in to `registry.tichymichal.net`, and start the published image:
 
 ```powershell
 docker compose pull
@@ -42,25 +43,13 @@ Treat the persistent volume as a secret. On Linux, the current Microsoft token-c
 
 ## Connect Codex Gateway
 
-Make the same `MAIL_CALENDAR_CONTACTS_MCP_KEY` value available to the gateway process. For the standard gateway Compose deployment, include this repository's environment-only override when starting it:
-
-```powershell
-docker compose `
-  --env-file .env `
-  --file ../CodexCLI-API-Gateway/compose.yaml `
-  --file gateway.compose.override.yaml `
-  up -d
-```
-
-Then add an HTTP MCP server through the gateway UI:
+Add an HTTP MCP server through the gateway UI:
 
 | Field | Value |
 | --- | --- |
 | Name | `Mail, Calendar & Contacts` |
 | URL | `http://mail-calendar-contacts-mcp:8080` |
 | Execution mode | `Gateway` |
-| Header | `X-Api-Key` |
-| Header environment variable | `MAIL_CALENDAR_CONTACTS_MCP_KEY` |
 
 Use **Test connection & discover tools** and select the tools that may be offered by this trusted server. The gateway catalog selection is separate from the per-API-key/project selection.
 
@@ -86,7 +75,7 @@ Leave both outbound-mail tools unselected in a gateway grant to prevent sending 
 1. Review the upstream changes and choose an immutable commit.
 2. Update `ADJUTANT_COMMIT` and the source archive SHA-256 in `Dockerfile` and `compose.yaml`.
 3. Rebase `patches/safe-defaults.patch` against that commit.
-4. Build the image and verify unauthenticated MCP requests receive `401`.
-5. Initialize an authenticated MCP session and verify all expected tools and server metadata.
+4. Build the image and verify the MCP endpoint is reachable only on the intended private network.
+5. Initialize an MCP session and verify all expected tools and server metadata.
 
 The upstream Apache 2.0 license is copied into `/licenses/adjutant-LICENSE` in the resulting image.
