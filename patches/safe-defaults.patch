@@ -1,0 +1,313 @@
+diff --git a/src/CalendarMcp.Auth/AccountConfigurationService.cs b/src/CalendarMcp.Auth/AccountConfigurationService.cs
+index cb8f911..1eee809 100644
+--- a/src/CalendarMcp.Auth/AccountConfigurationService.cs
++++ b/src/CalendarMcp.Auth/AccountConfigurationService.cs
+@@ -260,2 +260 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+-    /// Reads the optional Permissions block. Any flag the file omits defaults to granted, so
+-    /// configs written before permissions existed keep every capability they had.
++    /// Reads the optional Permissions block. Missing permissions use the safe account defaults.
+@@ -267 +266 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+-            return AccountPermissions.All;
++            return new AccountPermissions();
+@@ -269 +268 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+-        var permissions = AccountPermissions.All;
++        var permissions = new AccountPermissions();
+diff --git a/src/CalendarMcp.Core/Configuration/CalendarMcpServerOptions.cs b/src/CalendarMcp.Core/Configuration/CalendarMcpServerOptions.cs
+index 00b3a5d..583f575 100644
+--- a/src/CalendarMcp.Core/Configuration/CalendarMcpServerOptions.cs
++++ b/src/CalendarMcp.Core/Configuration/CalendarMcpServerOptions.cs
+@@ -52,2 +52,2 @@ public static class CalendarMcpServerOptions
+-            Name = "calendar-mcp",
+-            Title = "Adjutant",
++            Name = "mail-calendar-contacts",
++            Title = "Mail, Calendar & Contacts",
+diff --git a/src/CalendarMcp.Core/Constants/OAuthScopes.cs b/src/CalendarMcp.Core/Constants/OAuthScopes.cs
+index 6261815..acaf247 100644
+--- a/src/CalendarMcp.Core/Constants/OAuthScopes.cs
++++ b/src/CalendarMcp.Core/Constants/OAuthScopes.cs
+@@ -0,0 +1,2 @@
++using CalendarMcp.Core.Models;
++
+@@ -9 +11 @@ public static class GoogleScopes
+-    /// Full access scopes for Gmail and Calendar (used by OAuth flows and provider services).
++    /// Full access scopes retained for CLI compatibility.
+@@ -29,0 +32,36 @@ public static class GoogleScopes
++
++    /// <summary>Returns only the scopes required by the account's explicit grants.</summary>
++    public static string[] ForPermissions(AccountPermissions permissions)
++    {
++        var scopes = new List<string>();
++        if (permissions.EmailRead)
++        {
++            scopes.Add("https://www.googleapis.com/auth/gmail.modify");
++        }
++
++        if (permissions.EmailSend)
++        {
++            scopes.Add("https://www.googleapis.com/auth/gmail.send");
++        }
++
++        if (permissions.CalendarRead || permissions.CalendarWrite)
++        {
++            scopes.Add("https://www.googleapis.com/auth/calendar.readonly");
++        }
++
++        if (permissions.CalendarWrite)
++        {
++            scopes.Add("https://www.googleapis.com/auth/calendar.events");
++        }
++
++        if (permissions.ContactsWrite)
++        {
++            scopes.Add("https://www.googleapis.com/auth/contacts");
++        }
++        else if (permissions.ContactsRead)
++        {
++            scopes.Add("https://www.googleapis.com/auth/contacts.readonly");
++        }
++
++        return [.. scopes];
++    }
+@@ -38 +76 @@ public static class M365Scopes
+-    /// Default scopes for Microsoft Graph API access (mail read/write + calendar).
++    /// Full access scopes retained for CLI compatibility.
+@@ -68,0 +107,40 @@ public static class M365Scopes
++
++    /// <summary>Returns only the scopes required by the account's explicit grants.</summary>
++    public static string[] ForPermissions(AccountPermissions permissions, bool includeFilesRead = false)
++    {
++        var scopes = new List<string>();
++        if (permissions.EmailRead)
++        {
++            scopes.Add("Mail.ReadWrite");
++        }
++
++        if (permissions.EmailSend)
++        {
++            scopes.Add("Mail.Send");
++        }
++
++        if (permissions.CalendarWrite)
++        {
++            scopes.Add("Calendars.ReadWrite");
++        }
++        else if (permissions.CalendarRead)
++        {
++            scopes.Add("Calendars.Read");
++        }
++
++        if (permissions.ContactsWrite)
++        {
++            scopes.Add("Contacts.ReadWrite");
++        }
++        else if (permissions.ContactsRead)
++        {
++            scopes.Add("Contacts.Read");
++        }
++
++        if (includeFilesRead)
++        {
++            scopes.Add("Files.Read");
++        }
++
++        return [.. scopes];
++    }
+@@ -77 +155 @@ public static class OutlookComScopes
+-    /// Default scopes for Outlook.com personal accounts.
++    /// Full access scopes retained for CLI compatibility.
+@@ -99,0 +178,4 @@ public static class OutlookComScopes
++
++    /// <summary>Returns only the scopes required by the account's explicit grants.</summary>
++    public static string[] ForPermissions(AccountPermissions permissions, bool includeFilesRead = false) =>
++        M365Scopes.ForPermissions(permissions, includeFilesRead);
+diff --git a/src/CalendarMcp.Core/Models/AccountPermissions.cs b/src/CalendarMcp.Core/Models/AccountPermissions.cs
+index 4a4981d..c6993a9 100644
+--- a/src/CalendarMcp.Core/Models/AccountPermissions.cs
++++ b/src/CalendarMcp.Core/Models/AccountPermissions.cs
+@@ -29,3 +29,2 @@ public enum AccountPermission
+-/// Per-account grants controlling which MCP tools may touch the account. Every flag defaults to
+-/// <c>true</c> so existing configurations that predate this feature keep working unchanged; an
+-/// operator narrows an account by turning individual flags off.
++/// Per-account grants controlling which MCP tools may touch the account. Calendar read access
++/// defaults on while all mutations, email, and contacts require explicit opt-in.
+@@ -41 +40 @@ public class AccountPermissions
+-    public bool EmailRead { get; init; } = true;
++    public bool EmailRead { get; init; }
+@@ -44 +43 @@ public class AccountPermissions
+-    public bool EmailSend { get; init; } = true;
++    public bool EmailSend { get; init; }
+@@ -50 +49 @@ public class AccountPermissions
+-    public bool CalendarWrite { get; init; } = true;
++    public bool CalendarWrite { get; init; }
+@@ -53 +52 @@ public class AccountPermissions
+-    public bool ContactsRead { get; init; } = true;
++    public bool ContactsRead { get; init; }
+@@ -56 +55 @@ public class AccountPermissions
+-    public bool ContactsWrite { get; init; } = true;
++    public bool ContactsWrite { get; init; }
+@@ -59 +58,9 @@ public class AccountPermissions
+-    public static AccountPermissions All => new();
++    public static AccountPermissions All => new()
++    {
++        EmailRead = true,
++        EmailSend = true,
++        CalendarRead = true,
++        CalendarWrite = true,
++        ContactsRead = true,
++        ContactsWrite = true
++    };
+diff --git a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+index d19231c..fa8627d 100644
+--- a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+@@ -30,2 +29,0 @@ public class GoogleProviderService : IGoogleProviderService
+-    private static readonly string[] DefaultScopes = Constants.GoogleScopes.Default;
+-
+@@ -81 +79 @@ public class GoogleProviderService : IGoogleProviderService
+-                DefaultScopes,
++                Constants.GoogleScopes.ForPermissions(account.Permissions),
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index 94688d7..7bf5246 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -20,2 +19,0 @@ public class M365ProviderService : IM365ProviderService
+-    private static readonly string[] DefaultScopes = Constants.M365Scopes.Default;
+-
+@@ -51,18 +49 @@ public class M365ProviderService : IM365ProviderService
+-        // Use the scopes this account was actually consented for, if recorded; otherwise
+-        // fall back to the historical default so existing configs keep working unchanged.
+-        var scopes = DefaultScopes;
+-        if (account.ProviderConfig.TryGetValue("scopes", out var scopesValue) &&
+-            !string.IsNullOrWhiteSpace(scopesValue))
+-        {
+-            var parsedScopes = scopesValue.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+-            if (parsedScopes.Length > 0)
+-            {
+-                scopes = parsedScopes;
+-            }
+-            else
+-            {
+-                _logger.LogWarning(
+-                    "Account {AccountId} has a 'scopes' value with no valid entries; falling back to default scopes.",
+-                    accountId);
+-            }
+-        }
++        var scopes = Constants.M365Scopes.ForPermissions(account.Permissions);
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index c1c4018..fa73e3c 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -21,2 +20,0 @@ public class OutlookComProviderService : IOutlookComProviderService
+-    private static readonly string[] DefaultScopes = Constants.OutlookComScopes.Default;
+-
+@@ -57 +55 @@ public class OutlookComProviderService : IOutlookComProviderService
+-            DefaultScopes,
++            Constants.OutlookComScopes.ForPermissions(account.Permissions),
+diff --git a/src/CalendarMcp.HttpServer/Admin/AdminEndpoints.cs b/src/CalendarMcp.HttpServer/Admin/AdminEndpoints.cs
+index e98ff3b..156a2c3 100644
+--- a/src/CalendarMcp.HttpServer/Admin/AdminEndpoints.cs
++++ b/src/CalendarMcp.HttpServer/Admin/AdminEndpoints.cs
+@@ -138 +138 @@ public static class AdminEndpoints
+-            Permissions = request.Permissions ?? AccountPermissions.All,
++            Permissions = request.Permissions ?? new AccountPermissions(),
+@@ -328 +328,6 @@ public static class AdminEndpoints
+-        var authUrl = oauthManager.GetAuthorizationUrl(accountId, clientId, clientSecret, redirectUri);
++        var authUrl = oauthManager.GetAuthorizationUrl(
++            accountId,
++            clientId,
++            clientSecret,
++            redirectUri,
++            account.Permissions);
+diff --git a/src/CalendarMcp.HttpServer/Admin/DeviceCodeAuthManager.cs b/src/CalendarMcp.HttpServer/Admin/DeviceCodeAuthManager.cs
+index c051472..96903bb 100644
+--- a/src/CalendarMcp.HttpServer/Admin/DeviceCodeAuthManager.cs
++++ b/src/CalendarMcp.HttpServer/Admin/DeviceCodeAuthManager.cs
+@@ -112,8 +111,0 @@ public class DeviceCodeAuthManager
+-        // Start from the base scopes for the provider, plus offline_access for refresh tokens.
+-        // DeviceCodeAuthManager handles both M365 and Outlook.com personal accounts;
+-        // both share the same base scopes (OutlookComScopes.Default is the common subset).
+-        var scopeList = new List<string>(CalendarMcp.Core.Constants.OutlookComScopes.Default)
+-        {
+-            "offline_access"
+-        };
+-
+@@ -131 +123,3 @@ public class DeviceCodeAuthManager
+-        if (needsFilesRead)
++        var grantedScopes = CalendarMcp.Core.Constants.OutlookComScopes
++            .ForPermissions(account.Permissions, needsFilesRead);
++        if (grantedScopes.Length == 0)
+@@ -133,2 +127,2 @@ public class DeviceCodeAuthManager
+-            scopeList.Add("Files.Read");
+-            _logger.LogInformation("Including Files.Read scope for account {AccountId} (needed by JSON calendar accounts)", account.Id);
++            throw new InvalidOperationException(
++                $"Account '{account.Id}' has no enabled capabilities to authorize.");
+@@ -137 +131,3 @@ public class DeviceCodeAuthManager
+-        var scopes = scopeList.ToArray();
++        var scopes = grantedScopes
++            .Append("offline_access")
++            .ToArray();
+diff --git a/src/CalendarMcp.HttpServer/Admin/GoogleOAuthManager.cs b/src/CalendarMcp.HttpServer/Admin/GoogleOAuthManager.cs
+index 444e416..dee8a43 100644
+--- a/src/CalendarMcp.HttpServer/Admin/GoogleOAuthManager.cs
++++ b/src/CalendarMcp.HttpServer/Admin/GoogleOAuthManager.cs
+@@ -2,0 +3 @@ using CalendarMcp.Core.Configuration;
++using CalendarMcp.Core.Models;
+@@ -21,2 +21,0 @@ public class GoogleOAuthManager
+-    private static readonly string[] Scopes = CalendarMcp.Core.Constants.GoogleScopes.Default;
+-
+@@ -31 +30,6 @@ public class GoogleOAuthManager
+-    public string GetAuthorizationUrl(string accountId, string clientId, string clientSecret, string redirectUri)
++    public string GetAuthorizationUrl(
++        string accountId,
++        string clientId,
++        string clientSecret,
++        string redirectUri,
++        AccountPermissions permissions)
+@@ -33 +37,8 @@ public class GoogleOAuthManager
+-        var flow = CreateFlow(clientId, clientSecret);
++        var scopes = CalendarMcp.Core.Constants.GoogleScopes.ForPermissions(permissions);
++        if (scopes.Length == 0)
++        {
++            throw new InvalidOperationException(
++                $"Account '{accountId}' has no enabled capabilities to authorize.");
++        }
++
++        var flow = CreateFlow(clientId, clientSecret, scopes);
+@@ -40,0 +52 @@ public class GoogleOAuthManager
++            Scopes = scopes,
+@@ -49 +61 @@ public class GoogleOAuthManager
+-        authUrl.Scope = string.Join(" ", Scopes);
++        authUrl.Scope = string.Join(" ", scopes);
+@@ -74 +86 @@ public class GoogleOAuthManager
+-        var flow = CreateFlow(pending.ClientId, pending.ClientSecret);
++        var flow = CreateFlow(pending.ClientId, pending.ClientSecret, pending.Scopes);
+@@ -95 +107,4 @@ public class GoogleOAuthManager
+-    private static GoogleAuthorizationCodeFlow CreateFlow(string clientId, string clientSecret)
++    private static GoogleAuthorizationCodeFlow CreateFlow(
++        string clientId,
++        string clientSecret,
++        IReadOnlyCollection<string> scopes)
+@@ -104 +119 @@ public class GoogleOAuthManager
+-            Scopes = Scopes
++            Scopes = scopes
+@@ -124,0 +140 @@ public class GoogleOAuthManager
++        public required IReadOnlyCollection<string> Scopes { get; init; }
+diff --git a/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs b/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
+index aa41cdf..a558b67 100644
+--- a/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
++++ b/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
+@@ -23,4 +23,3 @@ public abstract class AccountFormBase
+-    // Per-capability grants. All default to true so an unmodified form keeps the historical
+-    // "account can do everything its provider supports" behaviour.
+-    public bool EmailRead { get; set; } = true;
+-    public bool EmailSend { get; set; } = true;
++    // New accounts default to calendar read-only; all mutations, email, and contacts are opt-in.
++    public bool EmailRead { get; set; }
++    public bool EmailSend { get; set; }
+@@ -28,3 +27,3 @@ public abstract class AccountFormBase
+-    public bool CalendarWrite { get; set; } = true;
+-    public bool ContactsRead { get; set; } = true;
+-    public bool ContactsWrite { get; set; } = true;
++    public bool CalendarWrite { get; set; }
++    public bool ContactsRead { get; set; }
++    public bool ContactsWrite { get; set; }

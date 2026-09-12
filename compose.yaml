@@ -1,0 +1,35 @@
+name: mcp-mail-calendar-contacts
+
+services:
+  mail-calendar-contacts-mcp:
+    image: ${MAIL_CALENDAR_CONTACTS_IMAGE:-mcp-mail-calendar-contacts:b38414b}
+    build:
+      context: .
+      args:
+        ADJUTANT_COMMIT: b38414bcfe666ef563d7f87c40b3c44dde096a7b
+        ADJUTANT_SOURCE_SHA256: bcba01f2a8a55a7441121d112d83ce2be495089c54490d76e52042d4313d5689
+    ports:
+      - "${MAIL_CALENDAR_CONTACTS_BIND_ADDRESS:-127.0.0.1}:5051:8080"
+    environment:
+      CALENDAR_MCP_ADMIN_TOKEN: "${MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN:?Set MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN}"
+      CALENDAR_MCP_MCP_KEY: "${MAIL_CALENDAR_CONTACTS_MCP_KEY:?Set MAIL_CALENDAR_CONTACTS_MCP_KEY}"
+      CALENDAR_MCP_CalendarMcp__Mcp__RequireApiKey: "true"
+      CALENDAR_MCP_CalendarMcp__ExternalBaseUrl: "${MAIL_CALENDAR_CONTACTS_MCP_EXTERNAL_URL:-http://localhost:5051}"
+    volumes:
+      - data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      gateway-backend:
+        aliases:
+          - mail-calendar-contacts-mcp
+    restart: unless-stopped
+
+volumes:
+  data:
+    name: mcp-mail-calendar-contacts-data
+
+networks:
+  gateway-backend:
+    external: true
+    name: ${CODEX_GATEWAY_BACKEND_NETWORK:-codex-gateway-backend}
