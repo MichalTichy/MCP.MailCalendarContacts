@@ -12,8 +12,7 @@ services:
       - "${MAIL_CALENDAR_CONTACTS_BIND_ADDRESS:-127.0.0.1}:5051:8080"
     environment:
       CALENDAR_MCP_ADMIN_TOKEN: "${MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN:?Set MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN}"
-      CALENDAR_MCP_MCP_KEY: "${MAIL_CALENDAR_CONTACTS_MCP_KEY:?Set MAIL_CALENDAR_CONTACTS_MCP_KEY}"
-      CALENDAR_MCP_CalendarMcp__Mcp__RequireApiKey: "true"
+      CALENDAR_MCP_CalendarMcp__Mcp__RequireApiKey: "false"
       CALENDAR_MCP_CalendarMcp__ExternalBaseUrl: "${MAIL_CALENDAR_CONTACTS_MCP_EXTERNAL_URL:-http://localhost:5051}"
     volumes:
       - data:/app/data

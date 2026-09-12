@@ -1,4 +1,0 @@
-services:
-  gateway:
-    environment:
-      MAIL_CALENDAR_CONTACTS_MCP_KEY: "${MAIL_CALENDAR_CONTACTS_MCP_KEY:?Set MAIL_CALENDAR_CONTACTS_MCP_KEY}"
