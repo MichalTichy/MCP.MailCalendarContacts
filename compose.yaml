@@ -2,7 +2,7 @@ name: mcp-mail-calendar-contacts
 
 services:
   mail-calendar-contacts-mcp:
-    image: ${MAIL_CALENDAR_CONTACTS_IMAGE:-mcp-mail-calendar-contacts:b38414b}
+    image: ${MAIL_CALENDAR_CONTACTS_IMAGE:-registry.tichymichal.net/mcp-mail-calendar-contacts:latest}
     build:
       context: .
       args:

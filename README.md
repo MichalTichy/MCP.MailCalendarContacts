@@ -25,11 +25,14 @@ The Compose deployment expects the external `codex-gateway-backend` network crea
 docker network create codex-gateway-backend
 ```
 
-Copy `.env.example` to `.env`, replace both tokens with different random values, and start the server:
+Copy `.env.example` to `.env`, replace both tokens with different random values, sign in to `registry.tichymichal.net`, and start the published image:
 
 ```powershell
-docker compose up --build -d
+docker compose pull
+docker compose up -d
 ```
+
+Use `docker compose up --build -d` instead when validating the pinned upstream source and local patch.
 
 Open `http://localhost:5051/admin/ui` and authenticate with `MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN` to configure provider accounts.
 
@@ -37,7 +40,17 @@ Treat the persistent volume as a secret. On Linux, the current Microsoft token-c
 
 ## Connect Codex Gateway
 
-Make the same `MAIL_CALENDAR_CONTACTS_MCP_KEY` value available to the gateway process, then add an HTTP MCP server through the gateway UI:
+Make the same `MAIL_CALENDAR_CONTACTS_MCP_KEY` value available to the gateway process. For the standard gateway Compose deployment, include this repository's environment-only override when starting it:
+
+```powershell
+docker compose `
+  --env-file .env `
+  --file ../CodexCLI-API-Gateway/compose.yaml `
+  --file gateway.compose.override.yaml `
+  up -d
+```
+
+Then add an HTTP MCP server through the gateway UI:
 
 | Field | Value |
 | --- | --- |
