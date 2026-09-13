@@ -10,6 +10,7 @@ ARG ADJUTANT_COMMIT
 ARG ADJUTANT_SOURCE_SHA256
 ADD https://github.com/MarimerLLC/calendar-mcp/archive/${ADJUTANT_COMMIT}.tar.gz /tmp/adjutant.tar.gz
 COPY patches/safe-defaults.patch /tmp/safe-defaults.patch
+COPY patches/reply-email.patch /tmp/reply-email.patch
 RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check - \
     && apt-get update \
     && apt-get install --yes --no-install-recommends patch \
@@ -17,6 +18,8 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && mkdir /source \
     && tar --extract --gzip --file /tmp/adjutant.tar.gz --directory /source --strip-components=1 \
     && patch --directory /source --strip=1 < /tmp/safe-defaults.patch \
+    && sed --in-place 's/\r$//' /source/src/CalendarMcp.Core/Services/IProviderService.cs \
+    && patch --directory /source --strip=1 < /tmp/reply-email.patch \
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \
