@@ -1,0 +1,577 @@
+diff --git a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+index f5039ec..43f2436 100644
+--- a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
++++ b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+@@ -63,6 +63,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<SearchEmailsTool>();
+         services.AddSingleton<SendEmailTool>();
+         services.AddSingleton<ReplyEmailTool>();
++        services.AddSingleton<SaveDraftTool>();
+         services.AddSingleton<DeleteEmailTool>();
+         services.AddSingleton<MarkEmailAsReadTool>();
+         services.AddSingleton<MoveEmailTool>();
+diff --git a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+index 4e4a6c5..46041fa 100644
+--- a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+@@ -551,6 +551,76 @@ public class GoogleProviderService : IGoogleProviderService
+         return sent.Id;
+     }
+ 
++    public async Task<string> SaveDraftAsync(
++        string accountId,
++        string? to,
++        string? subject,
++        string body,
++        string bodyFormat = "html",
++        List<string>? cc = null,
++        string? replyToEmailId = null,
++        bool replyAll = false,
++        CancellationToken cancellationToken = default)
++    {
++        var credential = await GetCredentialAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot save email draft: No authentication credential for account {accountId}");
++        var service = CreateGmailService(credential);
++        var draftMessage = new MimeMessage();
++        string? threadId = null;
++
++        if (!string.IsNullOrWhiteSpace(replyToEmailId))
++        {
++            var original = await service.Users.Messages.Get("me", replyToEmailId).ExecuteAsync(cancellationToken);
++            var headers = original.Payload?.Headers ?? [];
++            var profile = await service.Users.GetProfile("me").ExecuteAsync(cancellationToken);
++            var ownAddress = profile.EmailAddress ?? string.Empty;
++            draftMessage.From.Add(MailboxAddress.Parse(ownAddress));
++            var replyTo = GetHeader(headers, "Reply-To");
++            var from = GetHeader(headers, "From");
++            AddUniqueAddresses(draftMessage.To, string.IsNullOrWhiteSpace(replyTo) ? from : replyTo, ownAddress);
++            if (replyAll)
++            {
++                AddUniqueAddresses(draftMessage.To, GetHeader(headers, "To"), ownAddress);
++                AddUniqueAddresses(draftMessage.Cc, GetHeader(headers, "Cc"), ownAddress, draftMessage.To);
++            }
++
++            var originalSubject = GetHeader(headers, "Subject");
++            draftMessage.Subject = originalSubject.StartsWith("Re:", StringComparison.OrdinalIgnoreCase)
++                ? originalSubject
++                : $"Re: {originalSubject}";
++            var originalMessageId = GetHeader(headers, "Message-ID");
++            if (!string.IsNullOrWhiteSpace(originalMessageId))
++            {
++                draftMessage.InReplyTo = originalMessageId;
++                var references = GetHeader(headers, "References");
++                foreach (var reference in (references + " " + originalMessageId)
++                             .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++                    draftMessage.References.Add(reference);
++            }
++            threadId = original.ThreadId;
++        }
++        else
++        {
++            foreach (var address in (to ?? string.Empty).Split(',', ';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++                draftMessage.To.Add(MailboxAddress.Parse(address));
++            if (cc is { Count: > 0 })
++                foreach (var address in cc)
++                    draftMessage.Cc.Add(MailboxAddress.Parse(address));
++            draftMessage.Subject = subject ?? string.Empty;
++        }
++
++        draftMessage.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
++            ? MimeKit.Text.TextFormat.Plain
++            : MimeKit.Text.TextFormat.Html) { Text = body };
++        using var stream = new MemoryStream();
++        await draftMessage.WriteToAsync(stream, cancellationToken);
++        var raw = Convert.ToBase64String(stream.ToArray()).Replace('+', '-').Replace('/', '_').TrimEnd('=');
++        var saved = await service.Users.Drafts.Create(
++            new Draft { Message = new Message { Raw = raw, ThreadId = threadId } },
++            "me").ExecuteAsync(cancellationToken);
++        return saved.Id;
++    }
++
+     private static void AddUniqueAddresses(
+         InternetAddressList target,
+         string addresses,
+diff --git a/src/CalendarMcp.Core/Providers/IcsProviderService.cs b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+index 2646efa..ff50d14 100644
+--- a/src/CalendarMcp.Core/Providers/IcsProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+@@ -282,6 +282,13 @@ public class IcsProviderService : IIcsProviderService
+         string bodyFormat = "html", CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("ICS provider does not support replying to emails.");
+ 
++    public Task<string> SaveDraftAsync(
++        string accountId, string? to, string? subject, string body,
++        string bodyFormat = "html", List<string>? cc = null,
++        string? replyToEmailId = null, bool replyAll = false,
++        CancellationToken cancellationToken = default)
++        => throw new NotSupportedException("ICS provider does not support email drafts.");
++
+     public Task DeleteEmailAsync(
+         string accountId, string emailId,
+         CancellationToken cancellationToken = default)
+diff --git a/src/CalendarMcp.Core/Providers/ImapProviderService.cs b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+index 3d80378..edd65a0 100644
+--- a/src/CalendarMcp.Core/Providers/ImapProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+@@ -598,6 +598,70 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+         return reply.MessageId ?? string.Empty;
+     }
+ 
++    public async Task<string> SaveDraftAsync(
++        string accountId,
++        string? to,
++        string? subject,
++        string body,
++        string bodyFormat = "html",
++        List<string>? cc = null,
++        string? replyToEmailId = null,
++        bool replyAll = false,
++        CancellationToken cancellationToken = default)
++    {
++        var cfg = await ResolveConfigAsync(accountId);
++        var draft = new MimeMessage();
++        draft.From.Add(MailboxAddress.Parse(cfg.Username));
++
++        if (!string.IsNullOrWhiteSpace(replyToEmailId))
++        {
++            var (folderName, uidValidity, uid) = ParseEmailId(replyToEmailId);
++            var original = await WithImapAsync(cfg, async client =>
++            {
++                var folder = await OpenFolderAsync(client, folderName, FolderAccess.ReadOnly, cancellationToken);
++                EnsureUidValidity(folder, uidValidity, accountId, folderName);
++                return await folder.GetMessageAsync(new UniqueId(uid), cancellationToken);
++            }, cancellationToken) ?? throw new InvalidOperationException($"Email '{replyToEmailId}' was not found.");
++
++            AddReplyRecipients(draft.To, original.ReplyTo.Count > 0 ? original.ReplyTo : original.From, cfg.Username);
++            if (replyAll)
++            {
++                AddReplyRecipients(draft.To, original.To, cfg.Username);
++                AddReplyRecipients(draft.Cc, original.Cc, cfg.Username, draft.To);
++            }
++            draft.Subject = original.Subject?.StartsWith("Re:", StringComparison.OrdinalIgnoreCase) == true
++                ? original.Subject
++                : $"Re: {original.Subject}";
++            if (!string.IsNullOrWhiteSpace(original.MessageId))
++            {
++                draft.InReplyTo = original.MessageId;
++                foreach (var reference in original.References) draft.References.Add(reference);
++                draft.References.Add(original.MessageId);
++            }
++        }
++        else
++        {
++            foreach (var address in SplitAddresses(to ?? string.Empty))
++                draft.To.Add(MailboxAddress.Parse(address));
++            if (cc is { Count: > 0 })
++                foreach (var address in cc)
++                    draft.Cc.Add(MailboxAddress.Parse(address));
++            draft.Subject = subject ?? string.Empty;
++        }
++
++        draft.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
++            ? TextFormat.Plain
++            : TextFormat.Html) { Text = body };
++        await WithImapAsync(cfg, async client =>
++        {
++            var drafts = client.GetFolder(SpecialFolder.Drafts)
++                ?? throw new InvalidOperationException($"Account '{accountId}' does not expose an IMAP Drafts folder.");
++            await drafts.OpenAsync(FolderAccess.ReadWrite, cancellationToken);
++            await drafts.AppendAsync(draft, MessageFlags.Draft, DateTimeOffset.Now, cancellationToken);
++        }, cancellationToken);
++        return draft.MessageId ?? string.Empty;
++    }
++
+     private static void AddReplyRecipients(
+         InternetAddressList target,
+         InternetAddressList source,
+diff --git a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+index 4ec2c0f..e61ec13 100644
+--- a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+@@ -436,6 +436,13 @@ public class JsonCalendarProviderService : IJsonCalendarProviderService
+         string bodyFormat = "html", CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("JSON file provider is read-only; emails cannot be replied to.");
+ 
++    public Task<string> SaveDraftAsync(
++        string accountId, string? to, string? subject, string body,
++        string bodyFormat = "html", List<string>? cc = null,
++        string? replyToEmailId = null, bool replyAll = false,
++        CancellationToken cancellationToken = default)
++        => throw new NotSupportedException("JSON file provider is read-only; email drafts cannot be saved.");
++
+     public Task DeleteEmailAsync(
+         string accountId, string emailId,
+         CancellationToken cancellationToken = default)
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index 58f04c4..b649339 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -4,6 +4,8 @@ using Microsoft.Extensions.Logging;
+ using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+ using Microsoft.Graph.Me.SendMail;
++using Microsoft.Graph.Me.Messages.Item.CreateReply;
++using Microsoft.Graph.Me.Messages.Item.CreateReplyAll;
+ using Microsoft.Graph.Me.Messages.Item.Reply;
+ using Microsoft.Graph.Me.Messages.Item.ReplyAll;
+ using GraphContact = Microsoft.Graph.Models.Contact;
+@@ -498,6 +500,62 @@ public class M365ProviderService : IM365ProviderService
+         return $"accepted:{emailId}";
+     }
+ 
++    public async Task<string> SaveDraftAsync(
++        string accountId,
++        string? to,
++        string? subject,
++        string body,
++        string bodyFormat = "html",
++        List<string>? cc = null,
++        string? replyToEmailId = null,
++        bool replyAll = false,
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot save email draft: No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        var message = new Message
++        {
++            Subject = subject,
++            Body = new ItemBody
++            {
++                Content = body,
++                ContentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html
++            }
++        };
++
++        if (!string.IsNullOrWhiteSpace(replyToEmailId))
++        {
++            Message? draft;
++            if (replyAll)
++            {
++                draft = await graphClient.Me.Messages[replyToEmailId].CreateReplyAll.PostAsync(
++                    new CreateReplyAllPostRequestBody { Message = message },
++                    cancellationToken: cancellationToken);
++            }
++            else
++            {
++                draft = await graphClient.Me.Messages[replyToEmailId].CreateReply.PostAsync(
++                    new CreateReplyPostRequestBody { Message = message },
++                    cancellationToken: cancellationToken);
++            }
++            return draft?.Id ?? $"draft-reply:{replyToEmailId}";
++        }
++
++        message.ToRecipients = (to ?? string.Empty).Split(',', ';')
++            .Select(address => address.Trim())
++            .Where(address => address.Length > 0)
++            .Select(address => new Recipient { EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address } })
++            .ToList();
++        if (cc is { Count: > 0 })
++            message.CcRecipients = cc.Select(address => new Recipient
++            {
++                EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address.Trim() }
++            }).ToList();
++        var saved = await graphClient.Me.Messages.PostAsync(message, cancellationToken: cancellationToken);
++        return saved?.Id ?? string.Empty;
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index bd79163..453b1ae 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -4,6 +4,8 @@ using Microsoft.Extensions.Logging;
+ using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+ using Microsoft.Graph.Me.SendMail;
++using Microsoft.Graph.Me.Messages.Item.CreateReply;
++using Microsoft.Graph.Me.Messages.Item.CreateReplyAll;
+ using Microsoft.Graph.Me.Messages.Item.Reply;
+ using Microsoft.Graph.Me.Messages.Item.ReplyAll;
+ using GraphContact = Microsoft.Graph.Models.Contact;
+@@ -463,6 +465,62 @@ public class OutlookComProviderService : IOutlookComProviderService
+         return $"accepted:{emailId}";
+     }
+ 
++    public async Task<string> SaveDraftAsync(
++        string accountId,
++        string? to,
++        string? subject,
++        string body,
++        string bodyFormat = "html",
++        List<string>? cc = null,
++        string? replyToEmailId = null,
++        bool replyAll = false,
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot save email draft: No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        var message = new Message
++        {
++            Subject = subject,
++            Body = new ItemBody
++            {
++                Content = body,
++                ContentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html
++            }
++        };
++
++        if (!string.IsNullOrWhiteSpace(replyToEmailId))
++        {
++            Message? draft;
++            if (replyAll)
++            {
++                draft = await graphClient.Me.Messages[replyToEmailId].CreateReplyAll.PostAsync(
++                    new CreateReplyAllPostRequestBody { Message = message },
++                    cancellationToken: cancellationToken);
++            }
++            else
++            {
++                draft = await graphClient.Me.Messages[replyToEmailId].CreateReply.PostAsync(
++                    new CreateReplyPostRequestBody { Message = message },
++                    cancellationToken: cancellationToken);
++            }
++            return draft?.Id ?? $"draft-reply:{replyToEmailId}";
++        }
++
++        message.ToRecipients = (to ?? string.Empty).Split(',', ';')
++            .Select(address => address.Trim())
++            .Where(address => address.Length > 0)
++            .Select(address => new Recipient { EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address } })
++            .ToList();
++        if (cc is { Count: > 0 })
++            message.CcRecipients = cc.Select(address => new Recipient
++            {
++                EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address.Trim() }
++            }).ToList();
++        var saved = await graphClient.Me.Messages.PostAsync(message, cancellationToken: cancellationToken);
++        return saved?.Id ?? string.Empty;
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Services/IProviderService.cs b/src/CalendarMcp.Core/Services/IProviderService.cs
+index 3ac7198..0e5706f 100644
+--- a/src/CalendarMcp.Core/Services/IProviderService.cs
++++ b/src/CalendarMcp.Core/Services/IProviderService.cs
+@@ -60,6 +60,17 @@ public interface IProviderService
+         string bodyFormat = "html",
+         CancellationToken cancellationToken = default);
+ 
++    Task<string> SaveDraftAsync(
++        string accountId,
++        string? to,
++        string? subject,
++        string body,
++        string bodyFormat = "html",
++        List<string>? cc = null,
++        string? replyToEmailId = null,
++        bool replyAll = false,
++        CancellationToken cancellationToken = default);
++
+     Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Tools/SaveDraftTool.cs b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+new file mode 100644
+index 0000000..d6a07fc
+--- /dev/null
++++ b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+@@ -0,0 +1,74 @@
++using System.ComponentModel;
++using System.Text.Json;
++using CalendarMcp.Core.Services;
++using Microsoft.Extensions.Logging;
++using ModelContextProtocol;
++using ModelContextProtocol.Server;
++
++namespace CalendarMcp.Core.Tools;
++
++[McpServerToolType]
++public sealed class SaveDraftTool(
++    IAccountRegistry accountRegistry,
++    IProviderServiceFactory providerFactory,
++    ILogger<SaveDraftTool> logger)
++{
++    [McpServerTool(Name = "save_draft"), Description(
++        "Save an email draft without sending it. For a new message, provide accountId, to, subject, and body. To draft a native-thread reply, provide accountId, replyToEmailId, and body; recipients, subject, and thread are derived from the original email. Set replyAll only when all original participants should be included.")]
++    public async Task<string> SaveDraft(
++        [Description("Account in which to save the draft. Obtain from list_accounts.")] string accountId,
++        [Description("Draft body. Supply real HTML when bodyFormat is html; Markdown is not converted.")] string body,
++        [Description("Recipients for a new message. Required unless replyToEmailId is provided.")] List<string>? to = null,
++        [Description("Subject for a new message. Required unless replyToEmailId is provided.")] string? subject = null,
++        [Description("Draft body format: html (default) or text.")] string bodyFormat = "html",
++        [Description("Optional CC recipients for a new message. Reply drafts derive CC recipients from the original message when replyAll is true.")] List<string>? cc = null,
++        [Description("Provider email ID of the message being answered. Obtain from get_emails, search_emails, or get_email_details. Omit when composing a new message.")] string? replyToEmailId = null,
++        [Description("For a reply draft, include all original participants instead of only the sender. Ignored for a new message.")] bool replyAll = false)
++    {
++        if (string.IsNullOrWhiteSpace(accountId))
++            throw new McpException("accountId is required for save_draft.");
++        if (string.IsNullOrWhiteSpace(body))
++            throw new McpException("body is required for save_draft.");
++        if (!bodyFormat.Equals("html", StringComparison.OrdinalIgnoreCase) &&
++            !bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase))
++            throw new McpException("bodyFormat must be either 'html' or 'text'.");
++
++        var isReply = !string.IsNullOrWhiteSpace(replyToEmailId);
++        if (!isReply && (to is null || to.Count == 0))
++            throw new McpException("At least one recipient is required unless replyToEmailId is provided.");
++        if (!isReply && string.IsNullOrWhiteSpace(subject))
++            throw new McpException("subject is required unless replyToEmailId is provided.");
++
++        var account = await ToolGuard.RequireAccountAsync(
++            accountRegistry, accountId, Models.AccountPermission.EmailSend);
++
++        try
++        {
++            var provider = providerFactory.GetProvider(account.Provider);
++            var draftReference = await provider.SaveDraftAsync(
++                account.Id,
++                isReply ? null : string.Join(", ", to!),
++                isReply ? null : subject,
++                body,
++                bodyFormat,
++                isReply ? null : cc,
++                replyToEmailId,
++                replyAll,
++                CancellationToken.None);
++
++            return JsonSerializer.Serialize(new
++            {
++                success = true,
++                draftReference,
++                accountUsed = account.Id,
++                replyToEmailId,
++                replyAll = isReply && replyAll
++            }, new JsonSerializerOptions { WriteIndented = true });
++        }
++        catch (Exception ex) when (ex is not McpException)
++        {
++            logger.LogError(ex, "Error saving email draft in account {AccountId}", accountId);
++            throw new McpException("Failed to save email draft.", ex);
++        }
++    }
++}
+diff --git a/src/CalendarMcp.HttpServer/Program.cs b/src/CalendarMcp.HttpServer/Program.cs
+index 7aeeab1..78d5691 100644
+--- a/src/CalendarMcp.HttpServer/Program.cs
++++ b/src/CalendarMcp.HttpServer/Program.cs
+@@ -174,6 +174,7 @@ public class Program
+             .WithTools<CalendarMcp.Core.Tools.SearchEmailsTool>()
+             .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
++            .WithTools<CalendarMcp.Core.Tools.SaveDraftTool>()
+             .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+             .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.StdioServer/Program.cs b/src/CalendarMcp.StdioServer/Program.cs
+index 2b9edc7..8f5a41e 100644
+--- a/src/CalendarMcp.StdioServer/Program.cs
++++ b/src/CalendarMcp.StdioServer/Program.cs
+@@ -122,6 +122,7 @@ public class Program
+                     .WithTools<CalendarMcp.Core.Tools.SearchEmailsTool>()
+                     .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
++                    .WithTools<CalendarMcp.Core.Tools.SaveDraftTool>()
+                     .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs b/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs
+new file mode 100644
+index 0000000..3f4759d
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs
+@@ -0,0 +1,89 @@
++using System.Text.Json;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using CalendarMcp.Core.Tools;
++using CalendarMcp.Tests.Helpers;
++using Microsoft.Extensions.Logging.Abstractions;
++using ModelContextProtocol;
++using Rocks;
++
++namespace CalendarMcp.Tests.Tools;
++
++[TestClass]
++public class SaveDraftToolTests
++{
++    [TestMethod]
++    public async Task SaveDraft_NewMessage_PassesExplicitContentToProvider()
++    {
++        var account = TestData.CreateAccount(id: "sender", provider: "google");
++        var registry = new IAccountRegistryCreateExpectations();
++        registry.Setups.GetAccountAsync("sender").ReturnValue(Task.FromResult<AccountInfo?>(account));
++        var provider = new IProviderServiceCreateExpectations();
++        provider.Setups.SaveDraftAsync(
++                "sender", "to@example.com", "Subject", "Body", "text",
++                Arg.Any<List<string>?>(), Arg.Any<string?>(), false, Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult("draft-1"));
++        var factory = new IProviderServiceFactoryCreateExpectations();
++        factory.Setups.GetProvider("google").ReturnValue(provider.Instance());
++        var tool = new SaveDraftTool(registry.Instance(), factory.Instance(), NullLogger<SaveDraftTool>.Instance);
++
++        var json = await tool.SaveDraft(
++            "sender", "Body", ["to@example.com"], "Subject", "text");
++        using var document = JsonDocument.Parse(json);
++
++        Assert.AreEqual("draft-1", document.RootElement.GetProperty("draftReference").GetString());
++        Assert.IsTrue(document.RootElement.GetProperty("success").GetBoolean());
++        registry.Verify();
++        factory.Verify();
++        provider.Verify();
++    }
++
++    [TestMethod]
++    public async Task SaveDraft_Reply_DerivesAddressingFromOriginalMessage()
++    {
++        var account = TestData.CreateAccount(id: "sender", provider: "microsoft365");
++        var registry = new IAccountRegistryCreateExpectations();
++        registry.Setups.GetAccountAsync("sender").ReturnValue(Task.FromResult<AccountInfo?>(account));
++        var provider = new IProviderServiceCreateExpectations();
++        provider.Setups.SaveDraftAsync(
++                "sender", Arg.Any<string?>(), Arg.Any<string?>(), "Thanks", "html",
++                Arg.Any<List<string>?>(), "message-1", true,
++                Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult("draft-reply-1"));
++        var factory = new IProviderServiceFactoryCreateExpectations();
++        factory.Setups.GetProvider("microsoft365").ReturnValue(provider.Instance());
++        var tool = new SaveDraftTool(registry.Instance(), factory.Instance(), NullLogger<SaveDraftTool>.Instance);
++
++        var json = await tool.SaveDraft(
++            "sender", "Thanks", replyToEmailId: "message-1", replyAll: true);
++        using var document = JsonDocument.Parse(json);
++
++        Assert.AreEqual("draft-reply-1", document.RootElement.GetProperty("draftReference").GetString());
++        Assert.AreEqual("message-1", document.RootElement.GetProperty("replyToEmailId").GetString());
++        Assert.IsTrue(document.RootElement.GetProperty("replyAll").GetBoolean());
++        registry.Verify();
++        factory.Verify();
++        provider.Verify();
++    }
++
++    [TestMethod]
++    public async Task SaveDraft_ReadOnlyAccount_Throws()
++    {
++        var account = TestData.CreateAccount(
++            id: "read-only",
++            provider: "google",
++            permissions: AccountPermissions.None.With(AccountPermission.EmailRead, true));
++        var registry = new IAccountRegistryCreateExpectations();
++        registry.Setups.GetAccountAsync("read-only").ReturnValue(Task.FromResult<AccountInfo?>(account));
++        var tool = new SaveDraftTool(
++            registry.Instance(),
++            new IProviderServiceFactoryCreateExpectations().Instance(),
++            NullLogger<SaveDraftTool>.Instance);
++
++        var exception = await Assert.ThrowsExactlyAsync<McpException>(() =>
++            tool.SaveDraft("read-only", "Body", ["to@example.com"], "Subject"));
++
++        StringAssert.Contains(exception.Message, "does not permit sending email");
++        registry.Verify();
++    }
++}
