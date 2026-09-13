@@ -1,0 +1,487 @@
+diff --git a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+index 8eaf196..f5039ec 100644
+--- a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
++++ b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+@@ -62,6 +62,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<GetEmailAttachmentTool>();
+         services.AddSingleton<SearchEmailsTool>();
+         services.AddSingleton<SendEmailTool>();
++        services.AddSingleton<ReplyEmailTool>();
+         services.AddSingleton<DeleteEmailTool>();
+         services.AddSingleton<MarkEmailAsReadTool>();
+         services.AddSingleton<MoveEmailTool>();
+diff --git a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+index d19231c..4e4a6c5 100644
+--- a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+@@ -501,6 +501,73 @@ public class GoogleProviderService : IGoogleProviderService
+         }
+     }
+ 
++    public async Task<string> ReplyToEmailAsync(
++        string accountId,
++        string emailId,
++        string body,
++        bool replyAll = false,
++        string bodyFormat = "html",
++        CancellationToken cancellationToken = default)
++    {
++        var credential = await GetCredentialAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot reply to email: No authentication credential for account {accountId}");
++        var service = CreateGmailService(credential);
++        var original = await service.Users.Messages.Get("me", emailId).ExecuteAsync(cancellationToken);
++        var headers = original.Payload?.Headers ?? [];
++        var profile = await service.Users.GetProfile("me").ExecuteAsync(cancellationToken);
++        var ownAddress = profile.EmailAddress ?? string.Empty;
++
++        var reply = new MimeMessage();
++        reply.From.Add(MailboxAddress.Parse(ownAddress));
++        var replyTo = GetHeader(headers, "Reply-To");
++        var from = GetHeader(headers, "From");
++        AddUniqueAddresses(reply.To, string.IsNullOrWhiteSpace(replyTo) ? from : replyTo, ownAddress);
++        if (replyAll)
++        {
++            AddUniqueAddresses(reply.To, GetHeader(headers, "To"), ownAddress);
++            AddUniqueAddresses(reply.Cc, GetHeader(headers, "Cc"), ownAddress, reply.To);
++        }
++
++        var subject = GetHeader(headers, "Subject");
++        reply.Subject = subject.StartsWith("Re:", StringComparison.OrdinalIgnoreCase) ? subject : $"Re: {subject}";
++        var originalMessageId = GetHeader(headers, "Message-ID");
++        if (!string.IsNullOrWhiteSpace(originalMessageId))
++        {
++            reply.InReplyTo = originalMessageId;
++            var references = GetHeader(headers, "References");
++            foreach (var reference in (references + " " + originalMessageId)
++                         .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
++                reply.References.Add(reference);
++        }
++        reply.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
++            ? MimeKit.Text.TextFormat.Plain
++            : MimeKit.Text.TextFormat.Html) { Text = body };
++
++        using var stream = new MemoryStream();
++        await reply.WriteToAsync(stream, cancellationToken);
++        var raw = Convert.ToBase64String(stream.ToArray()).Replace('+', '-').Replace('/', '_').TrimEnd('=');
++        var sent = await service.Users.Messages.Send(new Message { Raw = raw, ThreadId = original.ThreadId }, "me")
++            .ExecuteAsync(cancellationToken);
++        return sent.Id;
++    }
++
++    private static void AddUniqueAddresses(
++        InternetAddressList target,
++        string addresses,
++        string ownAddress,
++        InternetAddressList? alreadyIncluded = null)
++    {
++        if (string.IsNullOrWhiteSpace(addresses)) return;
++        var existing = target.Mailboxes.Concat(alreadyIncluded?.Mailboxes ?? [])
++            .Select(address => address.Address)
++            .ToHashSet(StringComparer.OrdinalIgnoreCase);
++        foreach (var mailbox in InternetAddressList.Parse(addresses).Mailboxes)
++        {
++            if (!mailbox.Address.Equals(ownAddress, StringComparison.OrdinalIgnoreCase) && existing.Add(mailbox.Address))
++                target.Add(mailbox);
++        }
++    }
++
+ 
+     public async Task DeleteEmailAsync(
+         string accountId,
+diff --git a/src/CalendarMcp.Core/Providers/IcsProviderService.cs b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+index d554c7b..2646efa 100644
+--- a/src/CalendarMcp.Core/Providers/IcsProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+@@ -277,6 +277,11 @@ public class IcsProviderService : IIcsProviderService
+         CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("ICS provider does not support sending emails.");
+ 
++    public Task<string> ReplyToEmailAsync(
++        string accountId, string emailId, string body, bool replyAll = false,
++        string bodyFormat = "html", CancellationToken cancellationToken = default)
++        => throw new NotSupportedException("ICS provider does not support replying to emails.");
++
+     public Task DeleteEmailAsync(
+         string accountId, string emailId,
+         CancellationToken cancellationToken = default)
+diff --git a/src/CalendarMcp.Core/Providers/ImapProviderService.cs b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+index 8fadf51..3d80378 100644
+--- a/src/CalendarMcp.Core/Providers/ImapProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+@@ -538,6 +538,82 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+         return message.MessageId ?? string.Empty;
+     }
+ 
++    public async Task<string> ReplyToEmailAsync(
++        string accountId,
++        string emailId,
++        string body,
++        bool replyAll = false,
++        string bodyFormat = "html",
++        CancellationToken cancellationToken = default)
++    {
++        var (folderName, uidValidity, uid) = ParseEmailId(emailId);
++        var cfg = await ResolveConfigAsync(accountId);
++        var original = await WithImapAsync(cfg, async client =>
++        {
++            var folder = await OpenFolderAsync(client, folderName, FolderAccess.ReadOnly, cancellationToken);
++            EnsureUidValidity(folder, uidValidity, accountId, folderName);
++            return await folder.GetMessageAsync(new UniqueId(uid), cancellationToken);
++        }, cancellationToken) ?? throw new InvalidOperationException($"Email '{emailId}' was not found.");
++
++        var reply = new MimeMessage();
++        reply.From.Add(MailboxAddress.Parse(cfg.Username));
++        AddReplyRecipients(reply.To, original.ReplyTo.Count > 0 ? original.ReplyTo : original.From, cfg.Username);
++        if (replyAll)
++        {
++            AddReplyRecipients(reply.To, original.To, cfg.Username);
++            AddReplyRecipients(reply.Cc, original.Cc, cfg.Username, reply.To);
++        }
++        reply.Subject = original.Subject?.StartsWith("Re:", StringComparison.OrdinalIgnoreCase) == true
++            ? original.Subject
++            : $"Re: {original.Subject}";
++        if (!string.IsNullOrWhiteSpace(original.MessageId))
++        {
++            reply.InReplyTo = original.MessageId;
++            foreach (var reference in original.References) reply.References.Add(reference);
++            reply.References.Add(original.MessageId);
++        }
++        reply.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
++            ? TextFormat.Plain
++            : TextFormat.Html) { Text = body };
++
++        using (var smtp = await OpenSmtpAsync(cfg, cancellationToken))
++        {
++            await smtp.SendAsync(reply, cancellationToken);
++            await smtp.DisconnectAsync(true, cancellationToken);
++        }
++        try
++        {
++            await WithImapAsync(cfg, async imap =>
++            {
++                var sent = await imap.GetFolderAsync(cfg.SentFolder, cancellationToken);
++                await sent.OpenAsync(FolderAccess.ReadWrite, cancellationToken);
++                await sent.AppendAsync(reply, MessageFlags.Seen, DateTimeOffset.Now, cancellationToken);
++            }, cancellationToken);
++        }
++        catch (Exception ex)
++        {
++            _logger.LogWarning(ex, "Failed to append reply to {Folder} for {AccountId}", cfg.SentFolder, accountId);
++        }
++
++        return reply.MessageId ?? string.Empty;
++    }
++
++    private static void AddReplyRecipients(
++        InternetAddressList target,
++        InternetAddressList source,
++        string ownAddress,
++        InternetAddressList? alreadyIncluded = null)
++    {
++        var existing = target.Mailboxes.Concat(alreadyIncluded?.Mailboxes ?? [])
++            .Select(address => address.Address)
++            .ToHashSet(StringComparer.OrdinalIgnoreCase);
++        foreach (var mailbox in source.Mailboxes)
++        {
++            if (!mailbox.Address.Equals(ownAddress, StringComparison.OrdinalIgnoreCase) && existing.Add(mailbox.Address))
++                target.Add(mailbox);
++        }
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId, string emailId, CancellationToken cancellationToken = default)
+     {
+diff --git a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+index 24a81a6..4ec2c0f 100644
+--- a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+@@ -431,6 +431,11 @@ public class JsonCalendarProviderService : IJsonCalendarProviderService
+         CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("JSON file provider is read-only; emails cannot be sent.");
+ 
++    public Task<string> ReplyToEmailAsync(
++        string accountId, string emailId, string body, bool replyAll = false,
++        string bodyFormat = "html", CancellationToken cancellationToken = default)
++        => throw new NotSupportedException("JSON file provider is read-only; emails cannot be replied to.");
++
+     public Task DeleteEmailAsync(
+         string accountId, string emailId,
+         CancellationToken cancellationToken = default)
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index 94688d7..58f04c4 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -4,6 +4,8 @@ using Microsoft.Extensions.Logging;
+ using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+ using Microsoft.Graph.Me.SendMail;
++using Microsoft.Graph.Me.Messages.Item.Reply;
++using Microsoft.Graph.Me.Messages.Item.ReplyAll;
+ using GraphContact = Microsoft.Graph.Models.Contact;
+ 
+ namespace CalendarMcp.Core.Providers;
+@@ -466,6 +468,36 @@ public class M365ProviderService : IM365ProviderService
+         }
+     }
+ 
++    public async Task<string> ReplyToEmailAsync(
++        string accountId,
++        string emailId,
++        string body,
++        bool replyAll = false,
++        string bodyFormat = "html",
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot reply to email: No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        var contentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html;
++        var message = new Message { Body = new ItemBody { Content = body, ContentType = contentType } };
++
++        if (replyAll)
++        {
++            await graphClient.Me.Messages[emailId].ReplyAll.PostAsync(
++                new ReplyAllPostRequestBody { Message = message },
++                cancellationToken: cancellationToken);
++        }
++        else
++        {
++            await graphClient.Me.Messages[emailId].Reply.PostAsync(
++                new ReplyPostRequestBody { Message = message },
++                cancellationToken: cancellationToken);
++        }
++
++        return $"accepted:{emailId}";
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index c1c4018..bd79163 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -4,6 +4,8 @@ using Microsoft.Extensions.Logging;
+ using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+ using Microsoft.Graph.Me.SendMail;
++using Microsoft.Graph.Me.Messages.Item.Reply;
++using Microsoft.Graph.Me.Messages.Item.ReplyAll;
+ using GraphContact = Microsoft.Graph.Models.Contact;
+ 
+ namespace CalendarMcp.Core.Providers;
+@@ -431,6 +433,36 @@ public class OutlookComProviderService : IOutlookComProviderService
+         }
+     }
+ 
++    public async Task<string> ReplyToEmailAsync(
++        string accountId,
++        string emailId,
++        string body,
++        bool replyAll = false,
++        string bodyFormat = "html",
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"Cannot reply to email: No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        var contentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html;
++        var message = new Message { Body = new ItemBody { Content = body, ContentType = contentType } };
++
++        if (replyAll)
++        {
++            await graphClient.Me.Messages[emailId].ReplyAll.PostAsync(
++                new ReplyAllPostRequestBody { Message = message },
++                cancellationToken: cancellationToken);
++        }
++        else
++        {
++            await graphClient.Me.Messages[emailId].Reply.PostAsync(
++                new ReplyPostRequestBody { Message = message },
++                cancellationToken: cancellationToken);
++        }
++
++        return $"accepted:{emailId}";
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Services/IProviderService.cs b/src/CalendarMcp.Core/Services/IProviderService.cs
+index ae2f359..94dce82 100644
+--- a/src/CalendarMcp.Core/Services/IProviderService.cs
++++ b/src/CalendarMcp.Core/Services/IProviderService.cs
+@@ -40,7 +40,7 @@ public interface IProviderService
+         string attachmentId,
+         CancellationToken cancellationToken = default);
+     
+-    Task<string> SendEmailAsync(
++    Task<string> SendEmailAsync(
+         string accountId,
+         string to,
+         string subject,
+@@ -50,7 +50,15 @@ public interface IProviderService
+         IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         string? textBody = null,
+         string? htmlBody = null,
+-        CancellationToken cancellationToken = default);
++        CancellationToken cancellationToken = default);
++
++    Task<string> ReplyToEmailAsync(
++        string accountId,
++        string emailId,
++        string body,
++        bool replyAll = false,
++        string bodyFormat = "html",
++        CancellationToken cancellationToken = default);
+ 
+     Task DeleteEmailAsync(
+         string accountId,
+diff --git a/src/CalendarMcp.HttpServer/Program.cs b/src/CalendarMcp.HttpServer/Program.cs
+index a10578b..7aeeab1 100644
+--- a/src/CalendarMcp.HttpServer/Program.cs
++++ b/src/CalendarMcp.HttpServer/Program.cs
+@@ -173,6 +173,7 @@ public class Program
+             .WithTools<CalendarMcp.Core.Tools.GetEmailAttachmentTool>()
+             .WithTools<CalendarMcp.Core.Tools.SearchEmailsTool>()
+             .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
++            .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+             .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.StdioServer/Program.cs b/src/CalendarMcp.StdioServer/Program.cs
+index 1c04f8b..2b9edc7 100644
+--- a/src/CalendarMcp.StdioServer/Program.cs
++++ b/src/CalendarMcp.StdioServer/Program.cs
+@@ -121,6 +121,7 @@ public class Program
+                     .WithTools<CalendarMcp.Core.Tools.GetEmailAttachmentTool>()
+                     .WithTools<CalendarMcp.Core.Tools.SearchEmailsTool>()
+                     .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
++                    .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs b/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
+index 501f7a8..5a29522 100644
+--- a/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
++++ b/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
+@@ -132,6 +132,54 @@ public class PermissionEnforcementTests
+         regExp.Verify();
+     }
+ 
++    [TestMethod]
++    public async Task ReplyEmail_ReadOnlyAccount_Throws()
++    {
++        var account = Scoped("read-only", AccountPermission.EmailRead);
++
++        var regExp = new IAccountRegistryCreateExpectations();
++        regExp.Setups.GetAccountAsync("read-only")
++            .ReturnValue(Task.FromResult<AccountInfo?>(account));
++
++        var tool = new ReplyEmailTool(regExp.Instance(),
++            new IProviderServiceFactoryCreateExpectations().Instance(),
++            NullLogger<ReplyEmailTool>.Instance);
++
++        var ex = await Assert.ThrowsExactlyAsync<McpException>(
++            () => tool.ReplyEmail("read-only", "message-1", "Thanks"));
++
++        StringAssert.Contains(ex.Message, "does not permit sending email");
++        regExp.Verify();
++    }
++
++    [TestMethod]
++    public async Task ReplyEmail_SendAccount_UsesNativeProviderReply()
++    {
++        var account = Scoped("sender", AccountPermission.EmailSend, "google");
++        var regExp = new IAccountRegistryCreateExpectations();
++        regExp.Setups.GetAccountAsync("sender")
++            .ReturnValue(Task.FromResult<AccountInfo?>(account));
++
++        var provExp = new IProviderServiceCreateExpectations();
++        provExp.Setups.ReplyToEmailAsync("sender", "message-1", "Thanks", true, "text",
++                Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult("reply-1"));
++        var factExp = new IProviderServiceFactoryCreateExpectations();
++        factExp.Setups.GetProvider("google").ReturnValue(provExp.Instance());
++
++        var tool = new ReplyEmailTool(regExp.Instance(), factExp.Instance(),
++            NullLogger<ReplyEmailTool>.Instance);
++
++        var doc = JsonDocument.Parse(await tool.ReplyEmail(
++            "sender", "message-1", "Thanks", replyAll: true, bodyFormat: "text"));
++
++        Assert.AreEqual("reply-1", doc.RootElement.GetProperty("replyReference").GetString());
++        Assert.IsTrue(doc.RootElement.GetProperty("replyAll").GetBoolean());
++        regExp.Verify();
++        factExp.Verify();
++        provExp.Verify();
++    }
++
+     [TestMethod]
+     public async Task SendEmail_SmartRouting_SkipsDomainMatchThatCannotSend()
+     {
+diff --git a/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+new file mode 100644
+index 0000000..e316461
+--- /dev/null
++++ b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+@@ -0,0 +1,59 @@
++using System.ComponentModel;
++using System.Text.Json;
++using CalendarMcp.Core.Services;
++using Microsoft.Extensions.Logging;
++using ModelContextProtocol;
++using ModelContextProtocol.Server;
++
++namespace CalendarMcp.Core.Tools;
++
++[McpServerToolType]
++public sealed class ReplyEmailTool(
++    IAccountRegistry accountRegistry,
++    IProviderServiceFactory providerFactory,
++    ILogger<ReplyEmailTool> logger)
++{
++    [McpServerTool(Name = "reply_email"), Description(
++        "Reply to an existing email in its native provider thread. Both accountId and emailId are required; obtain them from get_emails, search_emails, or get_email_details. Set replyAll only when every original participant should receive the response.")]
++    public async Task<string> ReplyEmail(
++        [Description("Account that owns the original email. Obtain from list_accounts and the email's accountId.")] string accountId,
++        [Description("Provider email ID of the message being answered.")] string emailId,
++        [Description("Reply body. Supply real HTML when bodyFormat is html; Markdown is not converted.")] string body,
++        [Description("Reply to all original participants instead of only the sender. Defaults to false.")] bool replyAll = false,
++        [Description("Reply body format: html (default) or text.")] string bodyFormat = "html")
++    {
++        if (string.IsNullOrWhiteSpace(accountId))
++            throw new McpException("accountId is required for reply_email.");
++        if (string.IsNullOrWhiteSpace(emailId))
++            throw new McpException("emailId is required for reply_email.");
++        if (string.IsNullOrWhiteSpace(body))
++            throw new McpException("body is required for reply_email.");
++        if (!bodyFormat.Equals("html", StringComparison.OrdinalIgnoreCase) &&
++            !bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase))
++            throw new McpException("bodyFormat must be either 'html' or 'text'.");
++
++        var account = await ToolGuard.RequireAccountAsync(
++            accountRegistry, accountId, Models.AccountPermission.EmailSend);
++
++        try
++        {
++            var provider = providerFactory.GetProvider(account.Provider);
++            var replyReference = await provider.ReplyToEmailAsync(
++                account.Id, emailId, body, replyAll, bodyFormat, CancellationToken.None);
++
++            return JsonSerializer.Serialize(new
++            {
++                success = true,
++                replyReference,
++                accountUsed = account.Id,
++                repliedToMessageId = emailId,
++                replyAll
++            }, new JsonSerializerOptions { WriteIndented = true });
++        }
++        catch (Exception ex) when (ex is not McpException)
++        {
++            logger.LogError(ex, "Error replying to email {EmailId} from account {AccountId}", emailId, accountId);
++            throw new McpException("Failed to reply to email.", ex);
++        }
++    }
++}

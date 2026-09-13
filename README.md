@@ -57,18 +57,18 @@ For a gateway running directly on the host, use `http://localhost:5051` instead 
 
 ## Capability boundaries
 
-The server exposes 29 tools grouped by effect:
+The server exposes 30 tools grouped by effect:
 
 - Discovery: account listing and usage guidance.
 - Mail read: listing, searching, details, attachments, contextual summaries, and unsubscribe information.
 - Mail management: read-state changes, moves, and deletion, including bulk variants.
-- Outbound mail: `send_email` and `unsubscribe_from_email`.
+- Outbound mail: `send_email`, native-thread `reply_email`, and `unsubscribe_from_email`.
 - Calendar read: calendars, events, and event details.
 - Calendar write: create, update, delete, and respond to events.
 - Contacts read: list, search, and details.
 - Contacts write: create, update, and delete contacts.
 
-Leave both outbound-mail tools unselected in a gateway grant to prevent sending and outbound unsubscribe actions. Calendar and contact mutations can be disabled independently from their read tools.
+Leave the outbound-mail tools unselected in a gateway grant to prevent sending, replying, and outbound unsubscribe actions. Calendar and contact mutations can be disabled independently from their read tools.
 
 ## Updating Adjutant
 
