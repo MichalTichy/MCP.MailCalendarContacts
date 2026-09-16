@@ -12,6 +12,7 @@ ADD https://github.com/MarimerLLC/calendar-mcp/archive/${ADJUTANT_COMMIT}.tar.gz
 COPY patches/safe-defaults.patch /tmp/safe-defaults.patch
 COPY patches/reply-email.patch /tmp/reply-email.patch
 COPY patches/save-draft.patch /tmp/save-draft.patch
+COPY patches/calendar-wall-time.patch /tmp/calendar-wall-time.patch
 RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check - \
     && apt-get update \
     && apt-get install --yes --no-install-recommends patch \
@@ -22,6 +23,7 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && sed --in-place 's/\r$//' /source/src/CalendarMcp.Core/Services/IProviderService.cs \
     && patch --directory /source --strip=1 < /tmp/reply-email.patch \
     && patch --directory /source --strip=1 < /tmp/save-draft.patch \
+    && patch --directory /source --strip=1 < /tmp/calendar-wall-time.patch \
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \

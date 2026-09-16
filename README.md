@@ -17,6 +17,7 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
   execution when that option is applied.
 - Account configuration, OAuth caches, and protected IMAP/SMTP credentials remain in a dedicated volume.
 - The UI binds to loopback by default, and the container joins the gateway backend network rather than its runner network.
+- Calendar create/update normalizes offset-aware input into the requested calendar time zone before writing, while preserving offset-free local times.
 
 Codex Gateway provides the tool-authorization layer: each API key/project grant selects exact MCP tools, and its run-scoped relay rejects calls to tools outside that selection.
 
@@ -74,7 +75,7 @@ Leave the outbound-mail tools unselected in a gateway grant to prevent sending, 
 
 1. Review the upstream changes and choose an immutable commit.
 2. Update `ADJUTANT_COMMIT` and the source archive SHA-256 in `Dockerfile` and `compose.yaml`.
-3. Rebase `patches/safe-defaults.patch` against that commit.
+3. Rebase the patches in `patches/` against that commit.
 4. Build the image and verify the MCP endpoint is reachable only on the intended private network.
 5. Initialize an MCP session and verify all expected tools and server metadata.
 
