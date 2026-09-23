@@ -61,7 +61,7 @@ For a gateway running directly on the host, use `http://localhost:5051` instead 
 The server exposes 31 tools grouped by effect:
 
 - Discovery: account listing and usage guidance.
-- Mail read: listing, searching, details, attachments, contextual summaries, and unsubscribe information.
+- Mail read: listing, searching, details, contextual summaries, unsubscribe information, and attachments that can be stashed for outbound mail, returned inline for small clients, or exposed as an `agent_file` MCP resource for run-local inspection through Codex Gateway.
 - Mail management: read-state changes, moves, and deletion, including bulk variants.
 - Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, and `unsubscribe_from_email`.
 - Calendar read: calendars, events, and event details.
