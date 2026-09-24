@@ -1,0 +1,1551 @@
+From 0e79e2e150b814cdf782292ac5a25c94566e5df7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@local>
+Date: Thu, 24 Sep 2026 09:07:28 +0200
+Subject: [PATCH] Add account email signatures with inline images
+
+---
+ .../AccountConfigurationService.cs            |  61 ++++++++++
+ .../ServiceCollectionExtensions.cs            |   1 +
+ src/CalendarMcp.Core/Models/AccountInfo.cs    |   5 +
+ src/CalendarMcp.Core/Models/EmailSignature.cs |  29 +++++
+ .../Models/OutboundEmailAttachment.cs         |   5 +
+ .../Properties/AssemblyInfo.cs                |   3 +
+ .../Providers/GoogleProviderService.cs        |  10 +-
+ .../Providers/GraphAttachmentBuilder.cs       |  18 +++
+ .../Providers/IcsProviderService.cs           |   4 +-
+ .../Providers/ImapProviderService.cs          |  15 ++-
+ .../Providers/JsonCalendarProviderService.cs  |   4 +-
+ .../Providers/M365ProviderService.cs          |  24 +++-
+ .../Providers/MimeAttachmentBuilder.cs        |  41 ++++++-
+ .../Providers/OutlookComProviderService.cs    |  24 +++-
+ .../Services/ComposedEmailContent.cs          |  10 ++
+ .../Services/EmailCompositionService.cs       | 108 +++++++++++++++++
+ .../Services/IEmailCompositionService.cs      |  15 +++
+ .../Services/IProviderService.cs              |   2 +
+ src/CalendarMcp.Core/Skills/email.md          |  16 ++-
+ src/CalendarMcp.Core/Tools/ReplyEmailTool.cs  |  20 +++-
+ src/CalendarMcp.Core/Tools/SaveDraftTool.cs   |  20 +++-
+ src/CalendarMcp.Core/Tools/SendEmailTool.cs   |  23 +++-
+ .../BlazorAdmin/AccountFormModels.cs          |  31 +++++
+ .../Components/Pages/AddAccount.razor         |   5 +
+ .../Components/Pages/EditAccount.razor        |   7 +-
+ .../Shared/EmailSignatureEditor.razor         |  57 +++++++++
+ .../Shared/EmailSignatureEditor.razor.cs      | 109 ++++++++++++++++++
+ .../Auth/AccountConfigurationServiceTests.cs  |  52 +++++++--
+ src/CalendarMcp.Tests/Helpers/TestData.cs     |   4 +-
+ .../Providers/InlineAttachmentBuilderTests.cs |  46 ++++++++
+ .../Services/EmailCompositionServiceTests.cs  |  79 +++++++++++++
+ .../Tools/PermissionEnforcementTests.cs       |   1 +
+ .../Tools/SaveDraftToolTests.cs               |   4 +-
+ 33 files changed, 815 insertions(+), 38 deletions(-)
+ create mode 100644 src/CalendarMcp.Core/Models/EmailSignature.cs
+ create mode 100644 src/CalendarMcp.Core/Properties/AssemblyInfo.cs
+ create mode 100644 src/CalendarMcp.Core/Services/ComposedEmailContent.cs
+ create mode 100644 src/CalendarMcp.Core/Services/EmailCompositionService.cs
+ create mode 100644 src/CalendarMcp.Core/Services/IEmailCompositionService.cs
+ create mode 100644 src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor
+ create mode 100644 src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor.cs
+ create mode 100644 src/CalendarMcp.Tests/Providers/InlineAttachmentBuilderTests.cs
+ create mode 100644 src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
+
+diff --git a/src/CalendarMcp.Auth/AccountConfigurationService.cs b/src/CalendarMcp.Auth/AccountConfigurationService.cs
+index 1eee809..e9a6005 100644
+--- a/src/CalendarMcp.Auth/AccountConfigurationService.cs
++++ b/src/CalendarMcp.Auth/AccountConfigurationService.cs
+@@ -243,11 +243,31 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+             ["Priority"] = account.Priority,
+             ["Domains"] = new JsonArray(account.Domains.Select(d => JsonValue.Create(d)).ToArray<JsonNode?>()),
+             ["Permissions"] = PermissionsToNode(account.Permissions),
++            ["EmailSignature"] = EmailSignatureToNode(account.EmailSignature),
+             ["ProviderConfig"] = DictionaryToNode(account.ProviderConfig)
+         };
+         return obj;
+     }
+
++    private static JsonNode? EmailSignatureToNode(EmailSignature? signature)
++    {
++        if (signature is null) return null;
++
++        return new JsonObject
++        {
++            ["Enabled"] = signature.Enabled,
++            ["Html"] = signature.Html,
++            ["Text"] = signature.Text,
++            ["Images"] = new JsonArray(signature.Images.Select(image => (JsonNode?)new JsonObject
++            {
++                ["ContentId"] = image.ContentId,
++                ["Name"] = image.Name,
++                ["ContentType"] = image.ContentType,
++                ["Base64Content"] = image.Base64Content
++            }).ToArray())
++        };
++    }
++
+     private static JsonObject PermissionsToNode(AccountPermissions permissions)
+     {
+         var obj = new JsonObject();
+@@ -312,6 +332,7 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+             var priority = GetIntProperty(obj, "Priority") ?? 0;
+             var domains = GetStringListProperty(obj, "Domains");
+             var permissions = GetPermissionsProperty(obj);
++            var emailSignature = GetEmailSignatureProperty(obj);
+             var providerConfig = GetStringDictProperty(obj, "ProviderConfig");
+
+             results.Add(new AccountInfo
+@@ -323,6 +344,7 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+                 Priority = priority,
+                 Domains = domains,
+                 Permissions = permissions,
++                EmailSignature = emailSignature,
+                 ProviderConfig = providerConfig
+             });
+         }
+@@ -330,6 +352,45 @@ public sealed class AccountConfigurationService : IAccountConfigurationService
+         return results;
+     }
+
++    private static EmailSignature? GetEmailSignatureProperty(JsonObject obj)
++    {
++        var signatureNode = obj["EmailSignature"]?.AsObject() ?? obj["emailSignature"]?.AsObject();
++        if (signatureNode is null) return null;
++
++        var imagesNode = signatureNode["Images"]?.AsArray() ?? signatureNode["images"]?.AsArray();
++        var images = new List<EmailSignatureImage>();
++        if (imagesNode is not null)
++        {
++            foreach (var node in imagesNode)
++            {
++                var image = node?.AsObject();
++                if (image is null) continue;
++                var contentId = GetStringProperty(image, "ContentId");
++                var name = GetStringProperty(image, "Name");
++                var contentType = GetStringProperty(image, "ContentType");
++                var base64Content = GetStringProperty(image, "Base64Content");
++                if (contentId is null || name is null || contentType is null || base64Content is null)
++                    continue;
++
++                images.Add(new EmailSignatureImage
++                {
++                    ContentId = contentId,
++                    Name = name,
++                    ContentType = contentType,
++                    Base64Content = base64Content
++                });
++            }
++        }
++
++        return new EmailSignature
++        {
++            Enabled = GetBoolProperty(signatureNode, "Enabled") ?? false,
++            Html = GetStringProperty(signatureNode, "Html") ?? "",
++            Text = GetStringProperty(signatureNode, "Text") ?? "",
++            Images = images
++        };
++    }
++
+     private static bool? GetBoolProperty(JsonObject? obj, string pascalName)
+     {
+         if (obj is null) return null;
+diff --git a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+index 43f2436..ed3dbec 100644
+--- a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
++++ b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+@@ -29,6 +29,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<IJsonCalendarProviderService, JsonCalendarProviderService>();
+         services.AddSingleton<IImapProviderService, ImapProviderService>();
+         services.AddSingleton<IProviderServiceFactory, ProviderServiceFactory>();
++        services.AddSingleton<IEmailCompositionService, EmailCompositionService>();
+
+         // DataProtection + PasswordProtector for at-rest encryption of provider passwords
+         services.AddCalendarMcpDataProtection();
+diff --git a/src/CalendarMcp.Core/Models/AccountInfo.cs b/src/CalendarMcp.Core/Models/AccountInfo.cs
+index 53ec39b..79aa608 100644
+--- a/src/CalendarMcp.Core/Models/AccountInfo.cs
++++ b/src/CalendarMcp.Core/Models/AccountInfo.cs
+@@ -42,6 +42,11 @@ public class AccountInfo
+     /// </summary>
+     public AccountPermissions Permissions { get; init; } = new();
+
++    /// <summary>
++    /// Optional server-managed signature for ordinary outbound email.
++    /// </summary>
++    public EmailSignature? EmailSignature { get; init; }
++
+     /// <summary>
+     /// Provider-specific configuration (tenant ID, client ID, etc.).
+     /// Keys are compared case-insensitively so callers can use either camelCase
+diff --git a/src/CalendarMcp.Core/Models/EmailSignature.cs b/src/CalendarMcp.Core/Models/EmailSignature.cs
+new file mode 100644
+index 0000000..013f2d0
+--- /dev/null
++++ b/src/CalendarMcp.Core/Models/EmailSignature.cs
+@@ -0,0 +1,29 @@
++namespace CalendarMcp.Core.Models;
++
++/// <summary>
++/// Account-owned signature appended to ordinary outbound messages.
++/// The agent supplies only the message body; signature content stays in the
++/// account configuration and is composed server-side.
++/// </summary>
++public sealed class EmailSignature
++{
++    public bool Enabled { get; init; }
++
++    /// <summary>HTML fragment appended to HTML messages.</summary>
++    public string Html { get; init; } = "";
++
++    /// <summary>Plain-text fallback appended to text messages.</summary>
++    public string Text { get; init; } = "";
++
++    /// <summary>Images referenced from <see cref="Html"/> through cid: URLs.</summary>
++    public List<EmailSignatureImage> Images { get; init; } = [];
++}
++
++/// <summary>An inline image owned by an email signature.</summary>
++public sealed class EmailSignatureImage
++{
++    public required string ContentId { get; init; }
++    public required string Name { get; init; }
++    public required string ContentType { get; init; }
++    public required string Base64Content { get; init; }
++}
+diff --git a/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs b/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
+index b22341e..db66bca 100644
+--- a/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
++++ b/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
+@@ -34,6 +34,11 @@ public sealed class OutboundEmailAttachment
+     [JsonPropertyName("attachmentId")]
+     public string? AttachmentId { get; set; }
+
++    // Internal composition metadata. These members intentionally aren't
++    // public, so they don't become agent-controlled fields in the MCP schema.
++    internal bool IsInline { get; set; }
++    internal string? ContentId { get; set; }
++
+     /// <summary>
+     /// Decodes <see cref="Base64Content"/> into raw bytes. Throws
+     /// <see cref="FormatException"/> if the value is not valid base64, or
+diff --git a/src/CalendarMcp.Core/Properties/AssemblyInfo.cs b/src/CalendarMcp.Core/Properties/AssemblyInfo.cs
+new file mode 100644
+index 0000000..143d73d
+--- /dev/null
++++ b/src/CalendarMcp.Core/Properties/AssemblyInfo.cs
+@@ -0,0 +1,3 @@
++using System.Runtime.CompilerServices;
++
++[assembly: InternalsVisibleTo("CalendarMcp.Tests")]
+diff --git a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+index 695f7c5..cf51325 100644
+--- a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+@@ -505,6 +505,7 @@ public class GoogleProviderService : IGoogleProviderService
+         string body,
+         bool replyAll = false,
+         string bodyFormat = "html",
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var credential = await GetCredentialAsync(accountId, cancellationToken)
+@@ -537,9 +538,7 @@ public class GoogleProviderService : IGoogleProviderService
+                          .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                 reply.References.Add(reference);
+         }
+-        reply.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
+-            ? MimeKit.Text.TextFormat.Plain
+-            : MimeKit.Text.TextFormat.Html) { Text = body };
++        reply.Body = MimeAttachmentBuilder.BuildBody(body, bodyFormat, attachments);
+
+         using var stream = new MemoryStream();
+         await reply.WriteToAsync(stream, cancellationToken);
+@@ -558,6 +557,7 @@ public class GoogleProviderService : IGoogleProviderService
+         List<string>? cc = null,
+         string? replyToEmailId = null,
+         bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var credential = await GetCredentialAsync(accountId, cancellationToken)
+@@ -607,9 +607,7 @@ public class GoogleProviderService : IGoogleProviderService
+             draftMessage.Subject = subject ?? string.Empty;
+         }
+
+-        draftMessage.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
+-            ? MimeKit.Text.TextFormat.Plain
+-            : MimeKit.Text.TextFormat.Html) { Text = body };
++        draftMessage.Body = MimeAttachmentBuilder.BuildBody(body, bodyFormat, attachments);
+         using var stream = new MemoryStream();
+         await draftMessage.WriteToAsync(stream, cancellationToken);
+         var raw = Convert.ToBase64String(stream.ToArray()).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+diff --git a/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs b/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
+index 5671af1..9ca3cc9 100644
+--- a/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
++++ b/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
+@@ -1,4 +1,5 @@
+ using CalendarMcp.Core.Models;
++using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+
+ namespace CalendarMcp.Core.Providers;
+@@ -48,8 +49,25 @@ internal static class GraphAttachmentBuilder
+                 Name = att.Name,
+                 ContentType = att.ContentType,
+                 ContentBytes = bytes,
++                IsInline = att.IsInline,
++                ContentId = att.ContentId
+             });
+         }
+         return result;
+     }
++
++    public static async Task AddToMessageAsync(
++        GraphServiceClient graphClient,
++        string messageId,
++        IReadOnlyList<OutboundEmailAttachment>? attachments,
++        CancellationToken cancellationToken)
++    {
++        if (attachments is not { Count: > 0 }) return;
++
++        foreach (var attachment in Build(attachments))
++        {
++            await graphClient.Me.Messages[messageId].Attachments.PostAsync(
++                attachment, cancellationToken: cancellationToken);
++        }
++    }
+ }
+diff --git a/src/CalendarMcp.Core/Providers/IcsProviderService.cs b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+index ff50d14..3b31950 100644
+--- a/src/CalendarMcp.Core/Providers/IcsProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/IcsProviderService.cs
+@@ -279,13 +279,15 @@ public class IcsProviderService : IIcsProviderService
+
+     public Task<string> ReplyToEmailAsync(
+         string accountId, string emailId, string body, bool replyAll = false,
+-        string bodyFormat = "html", CancellationToken cancellationToken = default)
++        string bodyFormat = "html", IReadOnlyList<OutboundEmailAttachment>? attachments = null,
++        CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("ICS provider does not support replying to emails.");
+
+     public Task<string> SaveDraftAsync(
+         string accountId, string? to, string? subject, string body,
+         string bodyFormat = "html", List<string>? cc = null,
+         string? replyToEmailId = null, bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("ICS provider does not support email drafts.");
+
+diff --git a/src/CalendarMcp.Core/Providers/ImapProviderService.cs b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+index edd65a0..3bc914a 100644
+--- a/src/CalendarMcp.Core/Providers/ImapProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/ImapProviderService.cs
+@@ -449,6 +449,11 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+             }
+
+             var part = parts[index];
++            if (part.Content is null)
++            {
++                _logger.LogWarning("Attachment {Index} has no decodable MIME content", index);
++                return null;
++            }
+             using var ms = new MemoryStream();
+             await part.Content.DecodeToAsync(ms, cancellationToken);
+
+@@ -544,6 +549,7 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+         string body,
+         bool replyAll = false,
+         string bodyFormat = "html",
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var (folderName, uidValidity, uid) = ParseEmailId(emailId);
+@@ -572,9 +578,7 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+             foreach (var reference in original.References) reply.References.Add(reference);
+             reply.References.Add(original.MessageId);
+         }
+-        reply.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
+-            ? TextFormat.Plain
+-            : TextFormat.Html) { Text = body };
++        reply.Body = MimeAttachmentBuilder.BuildBody(body, bodyFormat, attachments);
+
+         using (var smtp = await OpenSmtpAsync(cfg, cancellationToken))
+         {
+@@ -607,6 +611,7 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+         List<string>? cc = null,
+         string? replyToEmailId = null,
+         bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var cfg = await ResolveConfigAsync(accountId);
+@@ -649,9 +654,7 @@ public class ImapProviderService : IImapProviderService, IAsyncDisposable, IDisp
+             draft.Subject = subject ?? string.Empty;
+         }
+
+-        draft.Body = new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
+-            ? TextFormat.Plain
+-            : TextFormat.Html) { Text = body };
++        draft.Body = MimeAttachmentBuilder.BuildBody(body, bodyFormat, attachments);
+         await WithImapAsync(cfg, async client =>
+         {
+             var drafts = client.GetFolder(SpecialFolder.Drafts)
+diff --git a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+index e61ec13..5eef2ec 100644
+--- a/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/JsonCalendarProviderService.cs
+@@ -433,13 +433,15 @@ public class JsonCalendarProviderService : IJsonCalendarProviderService
+
+     public Task<string> ReplyToEmailAsync(
+         string accountId, string emailId, string body, bool replyAll = false,
+-        string bodyFormat = "html", CancellationToken cancellationToken = default)
++        string bodyFormat = "html", IReadOnlyList<OutboundEmailAttachment>? attachments = null,
++        CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("JSON file provider is read-only; emails cannot be replied to.");
+
+     public Task<string> SaveDraftAsync(
+         string accountId, string? to, string? subject, string body,
+         string bodyFormat = "html", List<string>? cc = null,
+         string? replyToEmailId = null, bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+         => throw new NotSupportedException("JSON file provider is read-only; email drafts cannot be saved.");
+
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index 3ab926a..ee06345 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -457,6 +457,7 @@ public class M365ProviderService : IM365ProviderService
+         string body,
+         bool replyAll = false,
+         string bodyFormat = "html",
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var token = await GetAccessTokenAsync(accountId, cancellationToken)
+@@ -465,6 +466,21 @@ public class M365ProviderService : IM365ProviderService
+         var contentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html;
+         var message = new Message { Body = new ItemBody { Content = body, ContentType = contentType } };
+
++        if (attachments is { Count: > 0 })
++        {
++            Message? draft = replyAll
++                ? await graphClient.Me.Messages[emailId].CreateReplyAll.PostAsync(
++                    new CreateReplyAllPostRequestBody { Message = message }, cancellationToken: cancellationToken)
++                : await graphClient.Me.Messages[emailId].CreateReply.PostAsync(
++                    new CreateReplyPostRequestBody { Message = message }, cancellationToken: cancellationToken);
++
++            var draftId = draft?.Id
++                ?? throw new InvalidOperationException($"Microsoft Graph did not return a reply draft for '{emailId}'.");
++            await GraphAttachmentBuilder.AddToMessageAsync(graphClient, draftId, attachments, cancellationToken);
++            await graphClient.Me.Messages[draftId].Send.PostAsync(cancellationToken: cancellationToken);
++            return draftId;
++        }
++
+         if (replyAll)
+         {
+             await graphClient.Me.Messages[emailId].ReplyAll.PostAsync(
+@@ -490,6 +506,7 @@ public class M365ProviderService : IM365ProviderService
+         List<string>? cc = null,
+         string? replyToEmailId = null,
+         bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var token = await GetAccessTokenAsync(accountId, cancellationToken)
+@@ -520,7 +537,10 @@ public class M365ProviderService : IM365ProviderService
+                     new CreateReplyPostRequestBody { Message = message },
+                     cancellationToken: cancellationToken);
+             }
+-            return draft?.Id ?? $"draft-reply:{replyToEmailId}";
++            var draftId = draft?.Id ?? $"draft-reply:{replyToEmailId}";
++            if (draft?.Id is not null)
++                await GraphAttachmentBuilder.AddToMessageAsync(graphClient, draft.Id, attachments, cancellationToken);
++            return draftId;
+         }
+
+         message.ToRecipients = (to ?? string.Empty).Split(',', ';')
+@@ -534,6 +554,8 @@ public class M365ProviderService : IM365ProviderService
+                 EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address.Trim() }
+             }).ToList();
+         var saved = await graphClient.Me.Messages.PostAsync(message, cancellationToken: cancellationToken);
++        if (saved?.Id is not null)
++            await GraphAttachmentBuilder.AddToMessageAsync(graphClient, saved.Id, attachments, cancellationToken);
+         return saved?.Id ?? string.Empty;
+     }
+
+diff --git a/src/CalendarMcp.Core/Providers/MimeAttachmentBuilder.cs b/src/CalendarMcp.Core/Providers/MimeAttachmentBuilder.cs
+index ee17207..09879b4 100644
+--- a/src/CalendarMcp.Core/Providers/MimeAttachmentBuilder.cs
++++ b/src/CalendarMcp.Core/Providers/MimeAttachmentBuilder.cs
+@@ -26,7 +26,22 @@ internal static class MimeAttachmentBuilder
+                 $"Attachment '{attachment.Name}' has invalid base64 content.", nameof(attachment), ex);
+         }
+
+-        if (!string.IsNullOrWhiteSpace(attachment.ContentType)
++        if (attachment.IsInline)
++        {
++            MimeEntity resource;
++            if (!string.IsNullOrWhiteSpace(attachment.ContentType)
++                && ContentType.TryParse(attachment.ContentType, out var inlineType))
++            {
++                resource = builder.LinkedResources.Add(attachment.Name, bytes, inlineType);
++            }
++            else
++            {
++                resource = builder.LinkedResources.Add(attachment.Name, bytes);
++            }
++
++            resource.ContentId = attachment.ContentId;
++        }
++        else if (!string.IsNullOrWhiteSpace(attachment.ContentType)
+             && ContentType.TryParse(attachment.ContentType, out var ct))
+         {
+             builder.Attachments.Add(attachment.Name, bytes, ct);
+@@ -36,4 +51,28 @@ internal static class MimeAttachmentBuilder
+             builder.Attachments.Add(attachment.Name, bytes);
+         }
+     }
++
++    public static MimeEntity BuildBody(
++        string body,
++        string bodyFormat,
++        IReadOnlyList<OutboundEmailAttachment>? attachments)
++    {
++        if (attachments is not { Count: > 0 })
++        {
++            return new TextPart(bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase)
++                ? MimeKit.Text.TextFormat.Plain
++                : MimeKit.Text.TextFormat.Html) { Text = body };
++        }
++
++        var builder = new BodyBuilder();
++        if (bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase))
++            builder.TextBody = body;
++        else
++            builder.HtmlBody = body;
++
++        foreach (var attachment in attachments)
++            Add(builder, attachment);
++
++        return builder.ToMessageBody();
++    }
+ }
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index 998290f..689fc72 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -439,6 +439,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+         string body,
+         bool replyAll = false,
+         string bodyFormat = "html",
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var token = await GetAccessTokenAsync(accountId, cancellationToken)
+@@ -447,6 +448,21 @@ public class OutlookComProviderService : IOutlookComProviderService
+         var contentType = bodyFormat.Equals("text", StringComparison.OrdinalIgnoreCase) ? BodyType.Text : BodyType.Html;
+         var message = new Message { Body = new ItemBody { Content = body, ContentType = contentType } };
+
++        if (attachments is { Count: > 0 })
++        {
++            Message? draft = replyAll
++                ? await graphClient.Me.Messages[emailId].CreateReplyAll.PostAsync(
++                    new CreateReplyAllPostRequestBody { Message = message }, cancellationToken: cancellationToken)
++                : await graphClient.Me.Messages[emailId].CreateReply.PostAsync(
++                    new CreateReplyPostRequestBody { Message = message }, cancellationToken: cancellationToken);
++
++            var draftId = draft?.Id
++                ?? throw new InvalidOperationException($"Microsoft Graph did not return a reply draft for '{emailId}'.");
++            await GraphAttachmentBuilder.AddToMessageAsync(graphClient, draftId, attachments, cancellationToken);
++            await graphClient.Me.Messages[draftId].Send.PostAsync(cancellationToken: cancellationToken);
++            return draftId;
++        }
++
+         if (replyAll)
+         {
+             await graphClient.Me.Messages[emailId].ReplyAll.PostAsync(
+@@ -472,6 +488,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+         List<string>? cc = null,
+         string? replyToEmailId = null,
+         bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default)
+     {
+         var token = await GetAccessTokenAsync(accountId, cancellationToken)
+@@ -502,7 +519,10 @@ public class OutlookComProviderService : IOutlookComProviderService
+                     new CreateReplyPostRequestBody { Message = message },
+                     cancellationToken: cancellationToken);
+             }
+-            return draft?.Id ?? $"draft-reply:{replyToEmailId}";
++            var draftId = draft?.Id ?? $"draft-reply:{replyToEmailId}";
++            if (draft?.Id is not null)
++                await GraphAttachmentBuilder.AddToMessageAsync(graphClient, draft.Id, attachments, cancellationToken);
++            return draftId;
+         }
+
+         message.ToRecipients = (to ?? string.Empty).Split(',', ';')
+@@ -516,6 +536,8 @@ public class OutlookComProviderService : IOutlookComProviderService
+                 EmailAddress = new Microsoft.Graph.Models.EmailAddress { Address = address.Trim() }
+             }).ToList();
+         var saved = await graphClient.Me.Messages.PostAsync(message, cancellationToken: cancellationToken);
++        if (saved?.Id is not null)
++            await GraphAttachmentBuilder.AddToMessageAsync(graphClient, saved.Id, attachments, cancellationToken);
+         return saved?.Id ?? string.Empty;
+     }
+
+diff --git a/src/CalendarMcp.Core/Services/ComposedEmailContent.cs b/src/CalendarMcp.Core/Services/ComposedEmailContent.cs
+new file mode 100644
+index 0000000..3fda153
+--- /dev/null
++++ b/src/CalendarMcp.Core/Services/ComposedEmailContent.cs
+@@ -0,0 +1,10 @@
++using CalendarMcp.Core.Models;
++
++namespace CalendarMcp.Core.Services;
++
++public sealed record ComposedEmailContent(
++    string Body,
++    string? TextBody,
++    string? HtmlBody,
++    IReadOnlyList<OutboundEmailAttachment>? Attachments,
++    bool SignatureApplied);
+diff --git a/src/CalendarMcp.Core/Services/EmailCompositionService.cs b/src/CalendarMcp.Core/Services/EmailCompositionService.cs
+new file mode 100644
+index 0000000..bc2df34
+--- /dev/null
++++ b/src/CalendarMcp.Core/Services/EmailCompositionService.cs
+@@ -0,0 +1,108 @@
++using System.Net;
++using CalendarMcp.Core.Models;
++
++namespace CalendarMcp.Core.Services;
++
++/// <summary>
++/// Deterministically appends the selected account's signature and turns its
++/// cid images into provider-neutral inline resources.
++/// </summary>
++public sealed class EmailCompositionService : IEmailCompositionService
++{
++    public ComposedEmailContent Compose(
++        AccountInfo account,
++        string body,
++        string bodyFormat,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
++        string? textBody = null,
++        string? htmlBody = null,
++        bool includeSignature = true)
++    {
++        var signature = account.EmailSignature;
++        if (!includeSignature || signature is not { Enabled: true } ||
++            (string.IsNullOrWhiteSpace(signature.Html) && string.IsNullOrWhiteSpace(signature.Text)))
++        {
++            return new ComposedEmailContent(body, textBody, htmlBody, attachments, false);
++        }
++
++        var format = bodyFormat.ToLowerInvariant();
++        var composedBody = body;
++        var composedText = textBody;
++        var composedHtml = htmlBody;
++
++        switch (format)
++        {
++            case "text":
++                composedBody = AppendText(body, ResolveText(signature));
++                break;
++            case "multipart":
++                composedText = AppendText(textBody ?? "", ResolveText(signature));
++                composedHtml = AppendHtml(htmlBody ?? "", ResolveHtml(signature));
++                break;
++            default:
++                composedBody = AppendHtml(body, ResolveHtml(signature));
++                break;
++        }
++
++        IReadOnlyList<OutboundEmailAttachment>? composedAttachments = attachments;
++        if (format is "html" or "multipart" && signature.Images.Count > 0)
++        {
++            var result = attachments?.ToList() ?? [];
++            foreach (var image in signature.Images)
++            {
++                if (string.IsNullOrWhiteSpace(image.ContentId) ||
++                    string.IsNullOrWhiteSpace(image.Name) ||
++                    string.IsNullOrWhiteSpace(image.Base64Content))
++                    continue;
++
++                result.Add(new OutboundEmailAttachment
++                {
++                    Name = image.Name,
++                    ContentType = image.ContentType,
++                    Base64Content = image.Base64Content,
++                    IsInline = true,
++                    ContentId = image.ContentId
++                });
++            }
++            composedAttachments = result;
++        }
++
++        return new ComposedEmailContent(
++            composedBody, composedText, composedHtml, composedAttachments, true);
++    }
++
++    private static string ResolveHtml(EmailSignature signature)
++    {
++        if (!string.IsNullOrWhiteSpace(signature.Html))
++            return signature.Html.Trim();
++
++        return WebUtility.HtmlEncode(signature.Text.Trim())
++            .Replace("\r\n", "<br>", StringComparison.Ordinal)
++            .Replace("\n", "<br>", StringComparison.Ordinal);
++    }
++
++    private static string ResolveText(EmailSignature signature) =>
++        !string.IsNullOrWhiteSpace(signature.Text)
++            ? signature.Text.Trim()
++            : StripHtml(signature.Html).Trim();
++
++    private static string AppendHtml(string body, string signature) =>
++        string.IsNullOrWhiteSpace(signature)
++            ? body
++            : $"{body}<br><br><div class=\"email-signature\">{signature}</div>";
++
++    private static string AppendText(string body, string signature) =>
++        string.IsNullOrWhiteSpace(signature)
++            ? body
++            : $"{body.TrimEnd()}\r\n\r\n-- \r\n{signature}";
++
++    private static string StripHtml(string html)
++    {
++        if (string.IsNullOrWhiteSpace(html)) return "";
++        var withLines = System.Text.RegularExpressions.Regex.Replace(
++            html, @"<(br|/p|/div|/li)\b[^>]*>", "\n",
++            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
++        var withoutTags = System.Text.RegularExpressions.Regex.Replace(withLines, @"<[^>]+>", "");
++        return WebUtility.HtmlDecode(withoutTags);
++    }
++}
+diff --git a/src/CalendarMcp.Core/Services/IEmailCompositionService.cs b/src/CalendarMcp.Core/Services/IEmailCompositionService.cs
+new file mode 100644
+index 0000000..7ec3d83
+--- /dev/null
++++ b/src/CalendarMcp.Core/Services/IEmailCompositionService.cs
+@@ -0,0 +1,15 @@
++using CalendarMcp.Core.Models;
++
++namespace CalendarMcp.Core.Services;
++
++public interface IEmailCompositionService
++{
++    ComposedEmailContent Compose(
++        AccountInfo account,
++        string body,
++        string bodyFormat,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
++        string? textBody = null,
++        string? htmlBody = null,
++        bool includeSignature = true);
++}
+diff --git a/src/CalendarMcp.Core/Services/IProviderService.cs b/src/CalendarMcp.Core/Services/IProviderService.cs
+index 8950171..b269ae5 100644
+--- a/src/CalendarMcp.Core/Services/IProviderService.cs
++++ b/src/CalendarMcp.Core/Services/IProviderService.cs
+@@ -58,6 +58,7 @@ public interface IProviderService
+         string body,
+         bool replyAll = false,
+         string bodyFormat = "html",
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default);
+
+     Task<string> SaveDraftAsync(
+@@ -69,6 +70,7 @@ public interface IProviderService
+         List<string>? cc = null,
+         string? replyToEmailId = null,
+         bool replyAll = false,
++        IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default);
+
+     Task DeleteEmailAsync(
+diff --git a/src/CalendarMcp.Core/Skills/email.md b/src/CalendarMcp.Core/Skills/email.md
+index bf2498a..3196734 100644
+--- a/src/CalendarMcp.Core/Skills/email.md
++++ b/src/CalendarMcp.Core/Skills/email.md
+@@ -41,7 +41,7 @@ omitted. Same return shape as `get_emails`.
+ Returns full body, recipients, and the `attachments[]` array. Each
+ attachment has `attachmentId` — feed that to `get_email_attachment`.
+
+-### `send_email(to[], subject, body, accountId?, bodyFormat="html", cc?[], attachments?[], textBody?, htmlBody?)`
++### `send_email(to[], subject, body, accountId?, bodyFormat="html", cc?[], attachments?[], textBody?, htmlBody?, includeSignature=true)`
+
+ - `to` is an array of strings. Single recipient: `["alice@x"]`.
+ - `bodyFormat` defaults to `"html"`. Options:
+@@ -58,6 +58,20 @@ attachment has `attachmentId` — feed that to `get_email_attachment`.
+ - `attachments`: see `attachments` guide. Pass either `{attachmentId: "..."}`
+   (from the upload endpoint or `get_email_attachment` stash mode) or
+   `{name: "...", base64Content: "..."}` for very small files.
++- `includeSignature` defaults to `true`. The server appends the selected
++  account's configured signature, including inline images. Do not reconstruct
++  the signature in the body. Set this to `false` only when the user explicitly
++  asks for an unsigned message.
++
++### `reply_email(accountId, emailId, body, replyAll=false, bodyFormat="html", includeSignature=true)`
++
++Replies in the provider's native thread. The account signature is appended by
++the server by default; do not reproduce it in `body`.
++
++### `save_draft(accountId, body, to?[], subject?, bodyFormat="html", cc?[], replyToEmailId?, replyAll=false, includeSignature=true)`
++
++Creates a new-message or native-thread reply draft without sending it. The
++account signature is appended by default, including inline images.
+
+ ### `delete_email(accountId, emailId)`
+
+diff --git a/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+index e316461..aff52bb 100644
+--- a/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
++++ b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+@@ -11,8 +11,17 @@ namespace CalendarMcp.Core.Tools;
+ public sealed class ReplyEmailTool(
+     IAccountRegistry accountRegistry,
+     IProviderServiceFactory providerFactory,
++    IEmailCompositionService emailCompositionService,
+     ILogger<ReplyEmailTool> logger)
+ {
++    public ReplyEmailTool(
++        IAccountRegistry accountRegistry,
++        IProviderServiceFactory providerFactory,
++        ILogger<ReplyEmailTool> logger)
++        : this(accountRegistry, providerFactory, new EmailCompositionService(), logger)
++    {
++    }
++
+     [McpServerTool(Name = "reply_email"), Description(
+         "Reply to an existing email in its native provider thread. Both accountId and emailId are required; obtain them from get_emails, search_emails, or get_email_details. Set replyAll only when every original participant should receive the response.")]
+     public async Task<string> ReplyEmail(
+@@ -20,7 +29,8 @@ public sealed class ReplyEmailTool(
+         [Description("Provider email ID of the message being answered.")] string emailId,
+         [Description("Reply body. Supply real HTML when bodyFormat is html; Markdown is not converted.")] string body,
+         [Description("Reply to all original participants instead of only the sender. Defaults to false.")] bool replyAll = false,
+-        [Description("Reply body format: html (default) or text.")] string bodyFormat = "html")
++        [Description("Reply body format: html (default) or text.")] string bodyFormat = "html",
++        [Description("Append the configured signature of this account. Defaults to true. Set false only when the user explicitly requests an unsigned reply.")] bool includeSignature = true)
+     {
+         if (string.IsNullOrWhiteSpace(accountId))
+             throw new McpException("accountId is required for reply_email.");
+@@ -37,9 +47,12 @@ public sealed class ReplyEmailTool(
+
+         try
+         {
++            var composed = emailCompositionService.Compose(
++                account, body, bodyFormat, includeSignature: includeSignature);
+             var provider = providerFactory.GetProvider(account.Provider);
+             var replyReference = await provider.ReplyToEmailAsync(
+-                account.Id, emailId, body, replyAll, bodyFormat, CancellationToken.None);
++                account.Id, emailId, composed.Body, replyAll, bodyFormat,
++                composed.Attachments, CancellationToken.None);
+
+             return JsonSerializer.Serialize(new
+             {
+@@ -47,7 +60,8 @@ public sealed class ReplyEmailTool(
+                 replyReference,
+                 accountUsed = account.Id,
+                 repliedToMessageId = emailId,
+-                replyAll
++                replyAll,
++                signatureApplied = composed.SignatureApplied
+             }, new JsonSerializerOptions { WriteIndented = true });
+         }
+         catch (Exception ex) when (ex is not McpException)
+diff --git a/src/CalendarMcp.Core/Tools/SaveDraftTool.cs b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+index d6a07fc..c37df76 100644
+--- a/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
++++ b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+@@ -11,8 +11,17 @@ namespace CalendarMcp.Core.Tools;
+ public sealed class SaveDraftTool(
+     IAccountRegistry accountRegistry,
+     IProviderServiceFactory providerFactory,
++    IEmailCompositionService emailCompositionService,
+     ILogger<SaveDraftTool> logger)
+ {
++    public SaveDraftTool(
++        IAccountRegistry accountRegistry,
++        IProviderServiceFactory providerFactory,
++        ILogger<SaveDraftTool> logger)
++        : this(accountRegistry, providerFactory, new EmailCompositionService(), logger)
++    {
++    }
++
+     [McpServerTool(Name = "save_draft"), Description(
+         "Save an email draft without sending it. For a new message, provide accountId, to, subject, and body. To draft a native-thread reply, provide accountId, replyToEmailId, and body; recipients, subject, and thread are derived from the original email. Set replyAll only when all original participants should be included.")]
+     public async Task<string> SaveDraft(
+@@ -23,7 +32,8 @@ public sealed class SaveDraftTool(
+         [Description("Draft body format: html (default) or text.")] string bodyFormat = "html",
+         [Description("Optional CC recipients for a new message. Reply drafts derive CC recipients from the original message when replyAll is true.")] List<string>? cc = null,
+         [Description("Provider email ID of the message being answered. Obtain from get_emails, search_emails, or get_email_details. Omit when composing a new message.")] string? replyToEmailId = null,
+-        [Description("For a reply draft, include all original participants instead of only the sender. Ignored for a new message.")] bool replyAll = false)
++        [Description("For a reply draft, include all original participants instead of only the sender. Ignored for a new message.")] bool replyAll = false,
++        [Description("Append the configured signature of this account. Defaults to true. Set false only when the user explicitly requests an unsigned draft.")] bool includeSignature = true)
+     {
+         if (string.IsNullOrWhiteSpace(accountId))
+             throw new McpException("accountId is required for save_draft.");
+@@ -44,16 +54,19 @@ public sealed class SaveDraftTool(
+
+         try
+         {
++            var composed = emailCompositionService.Compose(
++                account, body, bodyFormat, includeSignature: includeSignature);
+             var provider = providerFactory.GetProvider(account.Provider);
+             var draftReference = await provider.SaveDraftAsync(
+                 account.Id,
+                 isReply ? null : string.Join(", ", to!),
+                 isReply ? null : subject,
+-                body,
++                composed.Body,
+                 bodyFormat,
+                 isReply ? null : cc,
+                 replyToEmailId,
+                 replyAll,
++                composed.Attachments,
+                 CancellationToken.None);
+
+             return JsonSerializer.Serialize(new
+@@ -62,7 +75,8 @@ public sealed class SaveDraftTool(
+                 draftReference,
+                 accountUsed = account.Id,
+                 replyToEmailId,
+-                replyAll = isReply && replyAll
++                replyAll = isReply && replyAll,
++                signatureApplied = composed.SignatureApplied
+             }, new JsonSerializerOptions { WriteIndented = true });
+         }
+         catch (Exception ex) when (ex is not McpException)
+diff --git a/src/CalendarMcp.Core/Tools/SendEmailTool.cs b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+index fac8812..4ffc63d 100644
+--- a/src/CalendarMcp.Core/Tools/SendEmailTool.cs
++++ b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+@@ -16,8 +16,18 @@ public sealed class SendEmailTool(
+     IAccountRegistry accountRegistry,
+     IProviderServiceFactory providerFactory,
+     IAttachmentStore attachmentStore,
++    IEmailCompositionService emailCompositionService,
+     ILogger<SendEmailTool> logger)
+ {
++    public SendEmailTool(
++        IAccountRegistry accountRegistry,
++        IProviderServiceFactory providerFactory,
++        IAttachmentStore attachmentStore,
++        ILogger<SendEmailTool> logger)
++        : this(accountRegistry, providerFactory, attachmentStore, new EmailCompositionService(), logger)
++    {
++    }
++
+     // Total decoded attachment payload limit per message. Keeps the JSON tool
+     // call within agent limits and matches typical provider caps (~25 MB).
+     private const long MaxTotalAttachmentBytes = 25L * 1024 * 1024;
+@@ -32,7 +42,8 @@ public sealed class SendEmailTool(
+         [Description("CC recipient email addresses")] List<string>? cc = null,
+         [Description("Optional file attachments as a JSON array. Each item must set EITHER \"attachmentId\" (preferred for anything non-trivial: upload the file via POST /attachments first to get the ID) OR \"base64Content\" (the raw bytes encoded as base64; use only for very small files). \"name\" is required when using base64Content and optional when using attachmentId. \"contentType\" is optional. Total decoded payload per message must stay under 25 MB; Microsoft 365 and Outlook.com cap each individual attachment at 3 MB. Examples: [{\"attachmentId\":\"AbCd...\"}] or [{\"name\":\"x.pdf\",\"base64Content\":\"...\"}].")] List<OutboundEmailAttachment>? attachments = null,
+         [Description("Plain-text body for multipart/alternative messages. Required when bodyFormat is 'multipart'.")] string? textBody = null,
+-        [Description("HTML body for multipart/alternative messages. Required when bodyFormat is 'multipart'. Must contain actual HTML markup.")] string? htmlBody = null)
++        [Description("HTML body for multipart/alternative messages. Required when bodyFormat is 'multipart'. Must contain actual HTML markup.")] string? htmlBody = null,
++        [Description("Append the configured signature of the sending account. Defaults to true. Set false only when the user explicitly requests an unsigned message.")] bool includeSignature = true)
+     {
+         // Strip CDATA wrappers if present (LLMs sometimes wrap content in XML CDATA)
+         body = StripCdataWrapper(body);
+@@ -125,17 +136,21 @@ public sealed class SendEmailTool(
+
+         try
+         {
++            var composed = emailCompositionService.Compose(
++                account, body, bodyFormat, resolvedAttachments, textBody, htmlBody, includeSignature);
++
+             // Send email
+             var provider = providerFactory.GetProvider(account.Provider);
+             var messageId = await provider.SendEmailAsync(
+-                account.Id, toJoined, subject, body, bodyFormat, cc, resolvedAttachments,
+-                textBody, htmlBody, CancellationToken.None);
++                account.Id, toJoined, subject, composed.Body, bodyFormat, cc, composed.Attachments,
++                composed.TextBody, composed.HtmlBody, CancellationToken.None);
+
+             var result = new
+             {
+                 success = true,
+                 messageId = messageId,
+-                accountUsed = account.Id
++                accountUsed = account.Id,
++                signatureApplied = composed.SignatureApplied
+             };
+
+             logger.LogInformation("Sent email from account {AccountId} to {To}", account.Id, toJoined);
+diff --git a/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs b/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
+index a558b67..07a1db4 100644
+--- a/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
++++ b/src/CalendarMcp.HttpServer/BlazorAdmin/AccountFormModels.cs
+@@ -28,6 +28,11 @@ public abstract class AccountFormBase
+     public bool ContactsRead { get; set; }
+     public bool ContactsWrite { get; set; }
+
++    public bool SignatureEnabled { get; set; }
++    public string SignatureHtml { get; set; } = "";
++    public string SignatureText { get; set; } = "";
++    public List<EmailSignatureImage> SignatureImages { get; set; } = [];
++
+     public List<string> ParseDomains() =>
+         Domains.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
+
+@@ -55,6 +60,29 @@ public abstract class AccountFormBase
+         ContactsWrite = permissions.ContactsWrite;
+     }
+
++    public void LoadSignature(EmailSignature? signature)
++    {
++        SignatureEnabled = signature?.Enabled ?? false;
++        SignatureHtml = signature?.Html ?? "";
++        SignatureText = signature?.Text ?? "";
++        SignatureImages = signature?.Images.ToList() ?? [];
++    }
++
++    public EmailSignature? ToEmailSignature()
++    {
++        if (!SignatureEnabled && string.IsNullOrWhiteSpace(SignatureHtml) &&
++            string.IsNullOrWhiteSpace(SignatureText) && SignatureImages.Count == 0)
++            return null;
++
++        return new EmailSignature
++        {
++            Enabled = SignatureEnabled,
++            Html = SignatureHtml,
++            Text = SignatureText,
++            Images = SignatureImages.ToList()
++        };
++    }
++
+     /// <summary>
+     /// What the currently-selected provider (and, for JSON, the paths entered so far) can do.
+     /// Toggles for capabilities the provider lacks are hidden rather than shown as dead controls.
+@@ -128,6 +156,7 @@ public class CreateAccountFormModel : AccountFormBase
+             Enabled = Enabled,
+             Priority = Priority,
+             Permissions = ToPermissions(),
++            EmailSignature = ToEmailSignature(),
+             ProviderConfig = providerConfig
+         };
+     }
+@@ -269,6 +298,7 @@ public class EditAccountFormModel : AccountFormBase
+         };
+
+         model.LoadPermissions(account.Permissions);
++        model.LoadSignature(account.EmailSignature);
+
+         var config = account.ProviderConfig;
+         var provider = account.Provider.ToLowerInvariant();
+@@ -338,6 +368,7 @@ public class EditAccountFormModel : AccountFormBase
+             Enabled = Enabled,
+             Priority = Priority,
+             Permissions = ToPermissions(),
++            EmailSignature = ToEmailSignature(),
+             ProviderConfig = BuildProviderConfig(passwordProtector)
+         };
+     }
+diff --git a/src/CalendarMcp.HttpServer/Components/Pages/AddAccount.razor b/src/CalendarMcp.HttpServer/Components/Pages/AddAccount.razor
+index 251a372..27f563f 100644
+--- a/src/CalendarMcp.HttpServer/Components/Pages/AddAccount.razor
++++ b/src/CalendarMcp.HttpServer/Components/Pages/AddAccount.razor
+@@ -261,6 +261,11 @@ else
+         @* Common fields *@
+         <PermissionsEditor Model="_model" />
+
++        @if (HasEmailSupport(_model.Provider))
++        {
++            <EmailSignatureEditor Model="_model" />
++        }
++
+         <div class="row">
+             @if (HasEmailSupport(_model.Provider))
+             {
+diff --git a/src/CalendarMcp.HttpServer/Components/Pages/EditAccount.razor b/src/CalendarMcp.HttpServer/Components/Pages/EditAccount.razor
+index 280afff..37ec6ef 100644
+--- a/src/CalendarMcp.HttpServer/Components/Pages/EditAccount.razor
++++ b/src/CalendarMcp.HttpServer/Components/Pages/EditAccount.razor
+@@ -249,6 +249,11 @@ else if (_model is not null)
+
+         <PermissionsEditor Model="_model" />
+
++        @if (HasEmailSupport(_model.Provider))
++        {
++            <EmailSignatureEditor Model="_model" />
++        }
++
+         <div class="row">
+             @if (HasEmailSupport(_model.Provider))
+             {
+@@ -385,5 +390,5 @@ else if (_model is not null)
+     }
+
+     private static bool HasEmailSupport(string provider) =>
+-        provider is "microsoft365" or "outlook.com" or "google";
++        provider is "microsoft365" or "outlook.com" or "google" or "imap";
+ }
+diff --git a/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor b/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor
+new file mode 100644
+index 0000000..b011a4c
+--- /dev/null
++++ b/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor
+@@ -0,0 +1,57 @@
++<div class="card mb-4">
++    <div class="card-header"><strong>Email signature</strong></div>
++    <div class="card-body">
++        <div class="form-check form-switch mb-3">
++            <InputCheckbox class="form-check-input" @bind-Value="Model.SignatureEnabled" />
++            <label class="form-check-label">Append this signature to new messages, replies, and drafts</label>
++        </div>
++
++        <div class="mb-3">
++            <label class="form-label">HTML signature</label>
++            <InputTextArea class="form-control font-monospace" rows="8" @bind-Value="Model.SignatureHtml" />
++            <div class="form-text">Use email-safe HTML. Uploaded images are inserted as <code>cid:</code> references.</div>
++        </div>
++
++        <div class="mb-3">
++            <label class="form-label">Plain-text fallback</label>
++            <InputTextArea class="form-control" rows="4" @bind-Value="Model.SignatureText" />
++            <div class="form-text">Used for plain-text messages. If empty, text is derived from the HTML.</div>
++        </div>
++
++        <div class="mb-3">
++            <label class="form-label">Inline images</label>
++            <InputFile class="form-control" OnChange="UploadImagesAsync" accept="image/png,image/jpeg,image/gif" multiple />
++            <div class="form-text">PNG, JPEG, or GIF; at most 5 images, 1 MB per image, and 2 MB total.</div>
++        </div>
++
++        @if (_error is not null)
++        {
++            <div class="alert alert-danger py-2">@_error</div>
++        }
++
++        @if (Model.SignatureImages.Count > 0)
++        {
++            <div class="list-group mb-3">
++                @foreach (var image in Model.SignatureImages)
++                {
++                    <div class="list-group-item d-flex align-items-center gap-3">
++                        <img src="@ImageSource(image)" alt="" style="max-width: 120px; max-height: 56px" />
++                        <div class="flex-grow-1 overflow-hidden">
++                            <div class="fw-semibold text-truncate">@image.Name</div>
++                            <code>cid:@image.ContentId</code>
++                        </div>
++                        <button type="button" class="btn btn-sm btn-outline-danger"
++                                @onclick="() => RemoveImage(image)">Remove</button>
++                    </div>
++                }
++            </div>
++        }
++
++        @if (!string.IsNullOrWhiteSpace(Model.SignatureHtml))
++        {
++            <label class="form-label">Preview</label>
++            <iframe class="w-100 border rounded bg-white" style="min-height: 180px"
++                    sandbox srcdoc="@PreviewHtml"></iframe>
++        }
++    </div>
++</div>
+diff --git a/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor.cs b/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor.cs
+new file mode 100644
+index 0000000..8e979e5
+--- /dev/null
++++ b/src/CalendarMcp.HttpServer/Components/Shared/EmailSignatureEditor.razor.cs
+@@ -0,0 +1,109 @@
++using CalendarMcp.Core.Models;
++using CalendarMcp.HttpServer.BlazorAdmin;
++using Microsoft.AspNetCore.Components;
++using Microsoft.AspNetCore.Components.Forms;
++
++namespace CalendarMcp.HttpServer.Components.Shared;
++
++public partial class EmailSignatureEditor
++{
++    private const long MaxImageBytes = 1024 * 1024;
++    private const long MaxTotalImageBytes = 2 * 1024 * 1024;
++    private const int MaxImageCount = 5;
++    private static readonly HashSet<string> AllowedTypes =
++        ["image/png", "image/jpeg", "image/gif"];
++
++    [Parameter, EditorRequired]
++    public AccountFormBase Model { get; set; } = default!;
++
++    private string? _error;
++
++    private string PreviewHtml
++    {
++        get
++        {
++            var html = Model.SignatureHtml;
++            foreach (var image in Model.SignatureImages)
++                html = html.Replace($"cid:{image.ContentId}", ImageSource(image), StringComparison.OrdinalIgnoreCase);
++            return html;
++        }
++    }
++
++    private async Task UploadImagesAsync(InputFileChangeEventArgs args)
++    {
++        _error = null;
++        IReadOnlyList<IBrowserFile> files;
++        try
++        {
++            files = args.GetMultipleFiles(MaxImageCount);
++        }
++        catch (InvalidOperationException)
++        {
++            _error = $"A signature can contain at most {MaxImageCount} images.";
++            return;
++        }
++        if (Model.SignatureImages.Count + files.Count > MaxImageCount)
++        {
++            _error = $"A signature can contain at most {MaxImageCount} images.";
++            return;
++        }
++
++        foreach (var file in files)
++        {
++            if (!AllowedTypes.Contains(file.ContentType))
++            {
++                _error = $"'{file.Name}' is not a supported image type.";
++                return;
++            }
++            if (file.Size > MaxImageBytes)
++            {
++                _error = $"'{file.Name}' is larger than 1 MB.";
++                return;
++            }
++
++            var existingBytes = Model.SignatureImages.Sum(GetDecodedLength);
++            if (existingBytes + file.Size > MaxTotalImageBytes)
++            {
++                _error = "Signature images may use at most 2 MB in total.";
++                return;
++            }
++
++            await using var stream = file.OpenReadStream(MaxImageBytes);
++            using var memory = new MemoryStream();
++            await stream.CopyToAsync(memory);
++            var contentId = $"signature-{Guid.NewGuid():N}";
++            Model.SignatureImages.Add(new EmailSignatureImage
++            {
++                ContentId = contentId,
++                Name = file.Name,
++                ContentType = file.ContentType,
++                Base64Content = Convert.ToBase64String(memory.ToArray())
++            });
++            Model.SignatureHtml = $"{Model.SignatureHtml.TrimEnd()}\n<img src=\"cid:{contentId}\" alt=\"\">".TrimStart();
++        }
++    }
++
++    private void RemoveImage(EmailSignatureImage image)
++    {
++        Model.SignatureImages.Remove(image);
++        Model.SignatureHtml = Model.SignatureHtml.Replace(
++            $"<img src=\"cid:{image.ContentId}\" alt=\"\">", "", StringComparison.OrdinalIgnoreCase);
++    }
++
++    private static long GetDecodedLength(EmailSignatureImage image)
++    {
++        try
++        {
++            return string.IsNullOrWhiteSpace(image.Base64Content)
++                ? 0
++                : Convert.FromBase64String(image.Base64Content).LongLength;
++        }
++        catch (FormatException)
++        {
++            return 0;
++        }
++    }
++
++    private static string ImageSource(EmailSignatureImage image) =>
++        $"data:{image.ContentType};base64,{image.Base64Content}";
++}
+diff --git a/src/CalendarMcp.Tests/Auth/AccountConfigurationServiceTests.cs b/src/CalendarMcp.Tests/Auth/AccountConfigurationServiceTests.cs
+index 49ec64c..6386ff6 100644
+--- a/src/CalendarMcp.Tests/Auth/AccountConfigurationServiceTests.cs
++++ b/src/CalendarMcp.Tests/Auth/AccountConfigurationServiceTests.cs
+@@ -77,6 +77,39 @@ public class AccountConfigurationServiceTests
+         Assert.IsTrue(stored.Permissions.ContactsWrite);
+     }
+
++    [TestMethod]
++    public async Task AddAccount_PersistsEmailSignatureAndImages()
++    {
++        var service = CreateService();
++        var signature = new EmailSignature
++        {
++            Enabled = true,
++            Html = "<strong>Michal</strong><img src=\"cid:logo\">",
++            Text = "Michal",
++            Images =
++            [
++                new EmailSignatureImage
++                {
++                    ContentId = "logo",
++                    Name = "logo.png",
++                    ContentType = "image/png",
++                    Base64Content = "AQID"
++                }
++            ]
++        };
++
++        await service.AddAccountAsync(TestData.CreateAccount(id: "signed", emailSignature: signature));
++
++        var stored = await service.GetAccountFromConfigAsync("signed");
++        Assert.IsNotNull(stored?.EmailSignature);
++        Assert.IsTrue(stored.EmailSignature.Enabled);
++        Assert.AreEqual(signature.Html, stored.EmailSignature.Html);
++        Assert.AreEqual("Michal", stored.EmailSignature.Text);
++        Assert.HasCount(1, stored.EmailSignature.Images);
++        Assert.AreEqual("logo", stored.EmailSignature.Images[0].ContentId);
++        Assert.AreEqual("AQID", stored.EmailSignature.Images[0].Base64Content);
++    }
++
+     [TestMethod]
+     public async Task AddAccount_WritesPermissionsAsCamelCaseJson()
+     {
+@@ -96,7 +129,7 @@ public class AccountConfigurationServiceTests
+     }
+
+     [TestMethod]
+-    public async Task GetAccount_ConfigWithNoPermissionsBlock_GrantsEverything()
++    public async Task GetAccount_ConfigWithNoPermissionsBlock_UsesSafeDefaults()
+     {
+         // A config written before this feature existed.
+         WriteConfig("""
+@@ -116,12 +149,16 @@ public class AccountConfigurationServiceTests
+         var stored = await CreateService().GetAccountFromConfigAsync("legacy");
+
+         Assert.IsNotNull(stored);
+-        foreach (var permission in AccountPermissions.AllPermissions)
+-            Assert.IsTrue(stored.Permissions.IsGranted(permission), permission.ToString());
++        Assert.IsFalse(stored.Permissions.EmailRead);
++        Assert.IsFalse(stored.Permissions.EmailSend);
++        Assert.IsTrue(stored.Permissions.CalendarRead);
++        Assert.IsFalse(stored.Permissions.CalendarWrite);
++        Assert.IsFalse(stored.Permissions.ContactsRead);
++        Assert.IsFalse(stored.Permissions.ContactsWrite);
+     }
+
+     [TestMethod]
+-    public async Task GetAccount_PartialPermissionsBlock_DefaultsOmittedFlagsToGranted()
++    public async Task GetAccount_PartialPermissionsBlock_DefaultsOmittedFlagsSafely()
+     {
+         WriteConfig("""
+             [
+@@ -139,8 +176,9 @@ public class AccountConfigurationServiceTests
+
+         Assert.IsNotNull(stored);
+         Assert.IsFalse(stored.Permissions.EmailSend);
+-        Assert.IsTrue(stored.Permissions.EmailRead);
+-        Assert.IsTrue(stored.Permissions.CalendarWrite);
++        Assert.IsFalse(stored.Permissions.EmailRead);
++        Assert.IsTrue(stored.Permissions.CalendarRead);
++        Assert.IsFalse(stored.Permissions.CalendarWrite);
+     }
+
+     [TestMethod]
+@@ -163,7 +201,7 @@ public class AccountConfigurationServiceTests
+         Assert.IsNotNull(stored);
+         Assert.IsFalse(stored.Permissions.EmailRead);
+         Assert.IsFalse(stored.Permissions.CalendarRead);
+-        Assert.IsTrue(stored.Permissions.ContactsRead);
++        Assert.IsFalse(stored.Permissions.ContactsRead);
+     }
+
+     [TestMethod]
+diff --git a/src/CalendarMcp.Tests/Helpers/TestData.cs b/src/CalendarMcp.Tests/Helpers/TestData.cs
+index bcd97e8..351b39c 100644
+--- a/src/CalendarMcp.Tests/Helpers/TestData.cs
++++ b/src/CalendarMcp.Tests/Helpers/TestData.cs
+@@ -11,7 +11,8 @@ internal static class TestData
+         bool enabled = true,
+         List<string>? domains = null,
+         Dictionary<string, string>? providerConfig = null,
+-        AccountPermissions? permissions = null)
++        AccountPermissions? permissions = null,
++        EmailSignature? emailSignature = null)
+     {
+         return new AccountInfo
+         {
+@@ -21,6 +22,7 @@ internal static class TestData
+             Enabled = enabled,
+             Domains = domains ?? ["example.com"],
+             Permissions = permissions ?? AccountPermissions.All,
++            EmailSignature = emailSignature,
+             ProviderConfig = providerConfig ?? new Dictionary<string, string>
+             {
+                 ["TenantId"] = "test-tenant",
+diff --git a/src/CalendarMcp.Tests/Providers/InlineAttachmentBuilderTests.cs b/src/CalendarMcp.Tests/Providers/InlineAttachmentBuilderTests.cs
+new file mode 100644
+index 0000000..44ba4f9
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Providers/InlineAttachmentBuilderTests.cs
+@@ -0,0 +1,46 @@
++using System.Text;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Providers;
++using Microsoft.Graph.Models;
++using MimeKit;
++
++namespace CalendarMcp.Tests.Providers;
++
++[TestClass]
++public class InlineAttachmentBuilderTests
++{
++    private static OutboundEmailAttachment CreateInlineImage() => new()
++    {
++        Name = "logo.png",
++        ContentType = "image/png",
++        Base64Content = Convert.ToBase64String([1, 2, 3]),
++        IsInline = true,
++        ContentId = "signature-logo"
++    };
++
++    [TestMethod]
++    public void GraphBuilder_MarksSignatureImageInline()
++    {
++        var result = GraphAttachmentBuilder.Build([CreateInlineImage()]);
++
++        var attachment = (FileAttachment)result.Single();
++        Assert.IsTrue(attachment.IsInline);
++        Assert.AreEqual("signature-logo", attachment.ContentId);
++        Assert.AreEqual("image/png", attachment.ContentType);
++    }
++
++    [TestMethod]
++    public async Task MimeBuilder_EmitsContentIdAndInlineDisposition()
++    {
++        var body = MimeAttachmentBuilder.BuildBody(
++            "<p>Hello</p><img src=\"cid:signature-logo\">", "html", [CreateInlineImage()]);
++        var message = new MimeMessage { Body = body };
++        using var stream = new MemoryStream();
++
++        await message.WriteToAsync(stream);
++        var mime = Encoding.UTF8.GetString(stream.ToArray());
++
++        StringAssert.Contains(mime, "Content-Id: <signature-logo>");
++        StringAssert.Contains(mime, "Content-Disposition: inline");
++    }
++}
+diff --git a/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs b/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
+new file mode 100644
+index 0000000..2134fb4
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
+@@ -0,0 +1,79 @@
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using CalendarMcp.Tests.Helpers;
++
++namespace CalendarMcp.Tests.Services;
++
++[TestClass]
++public class EmailCompositionServiceTests
++{
++    private static readonly EmailSignature Signature = new()
++    {
++        Enabled = true,
++        Html = "<strong>Michal</strong><img src=\"cid:logo\">",
++        Text = "Michal",
++        Images =
++        [
++            new EmailSignatureImage
++            {
++                ContentId = "logo",
++                Name = "logo.png",
++                ContentType = "image/png",
++                Base64Content = Convert.ToBase64String([1, 2, 3])
++            }
++        ]
++    };
++
++    private readonly EmailCompositionService _service = new();
++
++    [TestMethod]
++    public void Compose_Html_AppendsSignatureAndInlineImage()
++    {
++        var account = TestData.CreateAccount(emailSignature: Signature);
++
++        var result = _service.Compose(account, "<p>Hello</p>", "html");
++
++        StringAssert.Contains(result.Body, "<p>Hello</p>");
++        StringAssert.Contains(result.Body, "cid:logo");
++        Assert.IsTrue(result.SignatureApplied);
++        Assert.HasCount(1, result.Attachments!);
++        Assert.AreEqual("logo.png", result.Attachments![0].Name);
++    }
++
++    [TestMethod]
++    public void Compose_Text_UsesFallbackWithoutAttachingImages()
++    {
++        var account = TestData.CreateAccount(emailSignature: Signature);
++
++        var result = _service.Compose(account, "Hello", "text");
++
++        Assert.AreEqual("Hello\r\n\r\n-- \r\nMichal", result.Body);
++        Assert.IsNull(result.Attachments);
++        Assert.IsTrue(result.SignatureApplied);
++    }
++
++    [TestMethod]
++    public void Compose_Multipart_AppendsBothVariants()
++    {
++        var account = TestData.CreateAccount(emailSignature: Signature);
++
++        var result = _service.Compose(
++            account, "", "multipart", textBody: "Hello", htmlBody: "<p>Hello</p>");
++
++        StringAssert.Contains(result.TextBody!, "-- \r\nMichal");
++        StringAssert.Contains(result.HtmlBody!, "cid:logo");
++        Assert.HasCount(1, result.Attachments!);
++    }
++
++    [TestMethod]
++    public void Compose_IncludeSignatureFalse_LeavesMessageUntouched()
++    {
++        var account = TestData.CreateAccount(emailSignature: Signature);
++
++        var result = _service.Compose(account, "Body", "html", includeSignature: false);
++
++        Assert.AreEqual("Body", result.Body);
++        Assert.IsFalse(result.SignatureApplied);
++        Assert.IsNull(result.Attachments);
++    }
++}
+diff --git a/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs b/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
+index 5a29522..1c38c25 100644
+--- a/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
++++ b/src/CalendarMcp.Tests/Tools/PermissionEnforcementTests.cs
+@@ -162,6 +162,7 @@ public class PermissionEnforcementTests
+
+         var provExp = new IProviderServiceCreateExpectations();
+         provExp.Setups.ReplyToEmailAsync("sender", "message-1", "Thanks", true, "text",
++                Arg.Any<IReadOnlyList<OutboundEmailAttachment>?>(),
+                 Arg.Any<CancellationToken>())
+             .ReturnValue(Task.FromResult("reply-1"));
+         var factExp = new IProviderServiceFactoryCreateExpectations();
+diff --git a/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs b/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs
+index 3f4759d..50272a3 100644
+--- a/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs
++++ b/src/CalendarMcp.Tests/Tools/SaveDraftToolTests.cs
+@@ -21,7 +21,8 @@ public class SaveDraftToolTests
+         var provider = new IProviderServiceCreateExpectations();
+         provider.Setups.SaveDraftAsync(
+                 "sender", "to@example.com", "Subject", "Body", "text",
+-                Arg.Any<List<string>?>(), Arg.Any<string?>(), false, Arg.Any<CancellationToken>())
++                Arg.Any<List<string>?>(), Arg.Any<string?>(), false,
++                Arg.Any<IReadOnlyList<OutboundEmailAttachment>?>(), Arg.Any<CancellationToken>())
+             .ReturnValue(Task.FromResult("draft-1"));
+         var factory = new IProviderServiceFactoryCreateExpectations();
+         factory.Setups.GetProvider("google").ReturnValue(provider.Instance());
+@@ -48,6 +49,7 @@ public class SaveDraftToolTests
+         provider.Setups.SaveDraftAsync(
+                 "sender", Arg.Any<string?>(), Arg.Any<string?>(), "Thanks", "html",
+                 Arg.Any<List<string>?>(), "message-1", true,
++                Arg.Any<IReadOnlyList<OutboundEmailAttachment>?>(),
+                 Arg.Any<CancellationToken>())
+             .ReturnValue(Task.FromResult("draft-reply-1"));
+         var factory = new IProviderServiceFactoryCreateExpectations();
+--
+2.53.0.windows.3

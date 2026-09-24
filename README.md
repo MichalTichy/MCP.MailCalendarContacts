@@ -40,6 +40,11 @@ Use `docker compose up --build -d` instead when validating the pinned upstream s
 
 Open `http://localhost:5051/admin/ui` and authenticate with `MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN` to configure provider accounts.
 
+Each email-capable account can also define its own HTML signature, plain-text
+fallback, and inline PNG/JPEG/GIF images from the account editor. Signature
+images are embedded with MIME/Graph content IDs instead of remote URLs, and
+the complete configuration remains in the persistent data volume.
+
 Treat the persistent volume as a secret. On Linux, the current Microsoft token-cache implementation relies on owner-only file permissions rather than a host keyring.
 
 ## Connect Codex Gateway
@@ -63,7 +68,7 @@ The server exposes 31 tools grouped by effect:
 - Discovery: account listing and usage guidance.
 - Mail read: listing, searching, details, contextual summaries, unsubscribe information, and attachments that can be stashed for outbound mail, returned inline for small clients, or exposed as an `agent_file` MCP resource for run-local inspection through Codex Gateway.
 - Mail management: read-state changes, moves, and deletion, including bulk variants.
-- Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, and `unsubscribe_from_email`.
+- Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, and `unsubscribe_from_email`. Ordinary sends, replies, and drafts append the selected account's configured signature by default; automated unsubscribe messages remain unsigned.
 - Calendar read: calendars, events, and event details.
 - Calendar write: create, update, delete, and respond to events.
 - Contacts read: list, search, and details.
