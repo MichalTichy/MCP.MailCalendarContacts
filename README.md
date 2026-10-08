@@ -70,8 +70,9 @@ The server exposes 31 tools grouped by effect:
 - Discovery: account listing and usage guidance.
 - Mail read: listing, searching, details, contextual summaries, unsubscribe information, and attachments that can be stashed for outbound mail, returned inline for small clients, or exposed as an `agent_file` MCP resource for run-local inspection through Codex Gateway.
 - Mail management: read-state changes, moves, and deletion, including bulk variants.
-- Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, and `unsubscribe_from_email`. Ordinary sends, replies, and drafts append the selected account's configured signature by default; automated unsubscribe messages remain unsigned.
+- Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, `attach_to_draft`, and `unsubscribe_from_email`. Ordinary sends, replies, and drafts append the selected account's configured signature by default; automated unsubscribe messages remain unsigned.
 - `send_email` accepts `attachments: [{"agentFileUrl":"..."}]` for files supplied by another MCP server in the same Codex Gateway run. The mail server fetches the file over private HTTP, verifies its SHA-256 digest, and sends it as a normal attachment. The URL expires with the run; PDF bytes and base64 do not pass through the model context.
+- `attach_to_draft` uses the same short-lived file URL to add a file to an existing, unsent Microsoft 365 or Outlook.com draft. It checks that the message is still a draft and rejects a same-named file with different bytes; retrying the same file is safe. It never sends the message.
 - Calendar read: calendars, events, and event details.
 - Calendar write: create, update, delete, and respond to events.
 - Contacts read: list, search, and details.

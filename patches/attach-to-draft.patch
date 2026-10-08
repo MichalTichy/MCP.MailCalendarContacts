@@ -1,0 +1,293 @@
+diff --git a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+index f4c55bb..e3cea8b 100644
+--- a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
++++ b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+@@ -75,6 +75,7 @@ public static class ServiceCollectionExtensions
+         services.AddSingleton<SendEmailTool>();
+         services.AddSingleton<ReplyEmailTool>();
+         services.AddSingleton<SaveDraftTool>();
++        services.AddSingleton<AttachToDraftTool>();
+         services.AddSingleton<DeleteEmailTool>();
+         services.AddSingleton<MarkEmailAsReadTool>();
+         services.AddSingleton<MoveEmailTool>();
+diff --git a/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs b/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
+index 9ca3cc9..e54f965 100644
+--- a/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
++++ b/src/CalendarMcp.Core/Providers/GraphAttachmentBuilder.cs
+@@ -1,4 +1,5 @@
+ using CalendarMcp.Core.Models;
++using System.Security.Cryptography;
+ using Microsoft.Graph;
+ using Microsoft.Graph.Models;
+ 
+@@ -70,4 +71,40 @@ internal static class GraphAttachmentBuilder
+                 attachment, cancellationToken: cancellationToken);
+         }
+     }
++
++    public static async Task<bool> AddToExistingDraftAsync(
++        GraphServiceClient graphClient,
++        string draftId,
++        OutboundEmailAttachment attachment,
++        CancellationToken cancellationToken)
++    {
++        var draft = await graphClient.Me.Messages[draftId].GetAsync(cancellationToken: cancellationToken)
++            ?? throw new InvalidOperationException("The draft was not found in this mailbox.");
++        if (draft.IsDraft != true)
++            throw new InvalidOperationException("The selected message is not an unsent draft.");
++
++        var file = (FileAttachment)Build([attachment]).Single();
++        var existing = await graphClient.Me.Messages[draftId].Attachments.GetAsync(
++            cancellationToken: cancellationToken);
++        foreach (var item in existing?.Value ?? [])
++        {
++            if (!string.Equals(item.Name, file.Name, StringComparison.OrdinalIgnoreCase))
++                continue;
++
++            var current = await graphClient.Me.Messages[draftId].Attachments[item.Id].GetAsync(
++                cancellationToken: cancellationToken) as FileAttachment;
++            if (current?.ContentBytes is null)
++                throw new InvalidOperationException(
++                    "A same-named attachment already exists but cannot be verified.");
++            if (!CryptographicOperations.FixedTimeEquals(
++                    SHA256.HashData(current.ContentBytes), SHA256.HashData(file.ContentBytes!)))
++                throw new InvalidOperationException(
++                    "A different attachment with the same name already exists on the draft.");
++            return false;
++        }
++
++        await graphClient.Me.Messages[draftId].Attachments.PostAsync(
++            file, cancellationToken: cancellationToken);
++        return true;
++    }
+ }
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index ee06345..afd523d 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -559,6 +559,19 @@ public class M365ProviderService : IM365ProviderService
+         return saved?.Id ?? string.Empty;
+     }
+ 
++    public async Task<bool> AttachToDraftAsync(
++        string accountId,
++        string draftId,
++        OutboundEmailAttachment attachment,
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        return await GraphAttachmentBuilder.AddToExistingDraftAsync(
++            graphClient, draftId, attachment, cancellationToken);
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index 689fc72..53c2640 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -541,6 +541,19 @@ public class OutlookComProviderService : IOutlookComProviderService
+         return saved?.Id ?? string.Empty;
+     }
+ 
++    public async Task<bool> AttachToDraftAsync(
++        string accountId,
++        string draftId,
++        OutboundEmailAttachment attachment,
++        CancellationToken cancellationToken = default)
++    {
++        var token = await GetAccessTokenAsync(accountId, cancellationToken)
++            ?? throw new InvalidOperationException($"No authentication token for account {accountId}");
++        var graphClient = new GraphServiceClient(new BearerTokenAuthenticationProvider(token));
++        return await GraphAttachmentBuilder.AddToExistingDraftAsync(
++            graphClient, draftId, attachment, cancellationToken);
++    }
++
+     public async Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Services/IProviderService.cs b/src/CalendarMcp.Core/Services/IProviderService.cs
+index b269ae5..9e065b0 100644
+--- a/src/CalendarMcp.Core/Services/IProviderService.cs
++++ b/src/CalendarMcp.Core/Services/IProviderService.cs
+@@ -73,6 +73,13 @@ public interface IProviderService
+         IReadOnlyList<OutboundEmailAttachment>? attachments = null,
+         CancellationToken cancellationToken = default);
+ 
++    Task<bool> AttachToDraftAsync(
++        string accountId,
++        string draftId,
++        OutboundEmailAttachment attachment,
++        CancellationToken cancellationToken = default)
++        => throw new NotSupportedException("This provider does not support attaching files to an existing draft.");
++
+     Task DeleteEmailAsync(
+         string accountId,
+         string emailId,
+diff --git a/src/CalendarMcp.Core/Tools/AttachToDraftTool.cs b/src/CalendarMcp.Core/Tools/AttachToDraftTool.cs
+new file mode 100644
+index 0000000..5f35b26
+--- /dev/null
++++ b/src/CalendarMcp.Core/Tools/AttachToDraftTool.cs
+@@ -0,0 +1,54 @@
++using System.ComponentModel;
++using System.Text.Json;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using ModelContextProtocol;
++using ModelContextProtocol.Server;
++
++namespace CalendarMcp.Core.Tools;
++
++[McpServerToolType]
++public sealed class AttachToDraftTool(
++    IAccountRegistry accountRegistry,
++    IProviderServiceFactory providerFactory,
++    GatewayAgentFileDownloader agentFileDownloader)
++{
++    [McpServerTool(Name = "attach_to_draft"), Description(
++        "Attach a file from a run-scoped Codex Gateway agentFileUrl to an existing unsent email draft. " +
++        "The message is never sent. Supported for Microsoft 365 and Outlook.com accounts. " +
++        "The operation is idempotent when the same file name and bytes are already attached.")]
++    public async Task<string> AttachToDraft(
++        [Description("Account containing the existing draft; obtain from list_accounts.")] string accountId,
++        [Description("Provider draft ID returned by save_draft. Never use a sent message ID.")] string draftId,
++        [Description("Run-scoped artifact URL returned by another MCP tool through Codex Gateway.")] string agentFileUrl)
++    {
++        if (string.IsNullOrWhiteSpace(accountId) || string.IsNullOrWhiteSpace(draftId))
++            throw new McpException("accountId and draftId are required.");
++
++        var account = await ToolGuard.RequireAccountAsync(
++            accountRegistry, accountId, AccountPermission.EmailSend);
++        var attachment = await agentFileDownloader.DownloadAsync(new OutboundEmailAttachment
++        {
++            AgentFileUrl = agentFileUrl
++        });
++        var provider = providerFactory.GetProvider(account.Provider);
++        try
++        {
++            var attached = await provider.AttachToDraftAsync(
++                account.Id, draftId, attachment);
++            return JsonSerializer.Serialize(new
++            {
++                success = true,
++                attached,
++                alreadyAttached = !attached,
++                draftReference = draftId,
++                accountUsed = account.Id,
++                fileName = attachment.Name
++            });
++        }
++        catch (NotSupportedException exception)
++        {
++            throw new McpException(exception.Message, exception);
++        }
++    }
++}
+diff --git a/src/CalendarMcp.HttpServer/Program.cs b/src/CalendarMcp.HttpServer/Program.cs
+index 78d5691..34dbec9 100644
+--- a/src/CalendarMcp.HttpServer/Program.cs
++++ b/src/CalendarMcp.HttpServer/Program.cs
+@@ -175,6 +175,7 @@ public class Program
+             .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.SaveDraftTool>()
++            .WithTools<CalendarMcp.Core.Tools.AttachToDraftTool>()
+             .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+             .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+             .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.StdioServer/Program.cs b/src/CalendarMcp.StdioServer/Program.cs
+index 8f5a41e..42cd5a5 100644
+--- a/src/CalendarMcp.StdioServer/Program.cs
++++ b/src/CalendarMcp.StdioServer/Program.cs
+@@ -123,6 +123,7 @@ public class Program
+                     .WithTools<CalendarMcp.Core.Tools.SendEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.ReplyEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.SaveDraftTool>()
++                    .WithTools<CalendarMcp.Core.Tools.AttachToDraftTool>()
+                     .WithTools<CalendarMcp.Core.Tools.DeleteEmailTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MarkEmailAsReadTool>()
+                     .WithTools<CalendarMcp.Core.Tools.MoveEmailTool>()
+diff --git a/src/CalendarMcp.Tests/Tools/AttachToDraftToolTests.cs b/src/CalendarMcp.Tests/Tools/AttachToDraftToolTests.cs
+new file mode 100644
+index 0000000..d5bca4d
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Tools/AttachToDraftToolTests.cs
+@@ -0,0 +1,74 @@
++using System.Net;
++using System.Security.Cryptography;
++using System.Text.Json;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using CalendarMcp.Core.Tools;
++using CalendarMcp.Tests.Helpers;
++using Microsoft.Extensions.Configuration;
++using Rocks;
++
++namespace CalendarMcp.Tests.Tools;
++
++[TestClass]
++public sealed class AttachToDraftToolTests
++{
++    [TestMethod]
++    public async Task Attaches_gateway_file_to_existing_draft_without_sending()
++    {
++        var bytes = "invoice"u8.ToArray();
++        var account = TestData.CreateAccount(id: "riganti", provider: "microsoft365");
++        var registry = new IAccountRegistryCreateExpectations();
++        registry.Setups.GetAccountAsync("riganti").ReturnValue(Task.FromResult<AccountInfo?>(account));
++        var provider = new IProviderServiceCreateExpectations();
++        provider.Setups.AttachToDraftAsync(
++                "riganti", "draft-123", Arg.Any<OutboundEmailAttachment>(),
++                Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult(true));
++        var factory = new IProviderServiceFactoryCreateExpectations();
++        factory.Setups.GetProvider("microsoft365").ReturnValue(provider.Instance());
++        var downloader = new GatewayAgentFileDownloader(
++            new ClientFactory(new FileHandler(bytes)),
++            new ConfigurationBuilder().AddInMemoryCollection(new Dictionary<string, string?>
++            {
++                ["CalendarMcp:AgentFileOrigin"] = "http://gateway:8080"
++            }).Build());
++        var tool = new AttachToDraftTool(registry.Instance(), factory.Instance(), downloader);
++
++        var result = await tool.AttachToDraft(
++            "riganti", "draft-123",
++            "http://gateway:8080/_internal/mcp/artifacts/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO_0");
++        using var json = JsonDocument.Parse(result);
++
++        Assert.IsTrue(json.RootElement.GetProperty("attached").GetBoolean());
++        Assert.AreEqual("invoice.pdf", json.RootElement.GetProperty("fileName").GetString());
++        registry.Verify();
++        factory.Verify();
++        provider.Verify();
++    }
++
++    private sealed class ClientFactory(HttpMessageHandler handler) : IHttpClientFactory
++    {
++        public HttpClient CreateClient(string name) => new(handler);
++    }
++
++    private sealed class FileHandler(byte[] bytes) : HttpMessageHandler
++    {
++        protected override Task<HttpResponseMessage> SendAsync(
++            HttpRequestMessage request,
++            CancellationToken cancellationToken)
++        {
++            var response = new HttpResponseMessage(HttpStatusCode.OK)
++            {
++                Content = new ByteArrayContent(bytes)
++            };
++            response.Content.Headers.ContentDisposition =
++                new System.Net.Http.Headers.ContentDispositionHeaderValue("attachment")
++                {
++                    FileNameStar = "invoice.pdf"
++                };
++            response.Headers.Add("X-Content-SHA256", Convert.ToHexStringLower(SHA256.HashData(bytes)));
++            return Task.FromResult(response);
++        }
++    }
++}
