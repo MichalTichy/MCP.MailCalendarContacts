@@ -1,0 +1,300 @@
+diff --git a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+index ed3dbec..f4c55bb 100644
+--- a/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
++++ b/src/CalendarMcp.Core/Configuration/ServiceCollectionExtensions.cs
+@@ -43,6 +43,16 @@ public static class ServiceCollectionExtensions
+             client.Timeout = TimeSpan.FromSeconds(10);
+         });
+ 
++        services.AddHttpClient("GatewayAgentFiles", client =>
++        {
++            client.Timeout = TimeSpan.FromSeconds(30);
++        }).ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler
++        {
++            AllowAutoRedirect = false,
++            UseCookies = false
++        });
++        services.AddSingleton<GatewayAgentFileDownloader>();
++
+         // Register unsubscribe executor
+         services.AddSingleton<UnsubscribeExecutor>();
+         
+diff --git a/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs b/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
+index db66bca..59571b0 100644
+--- a/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
++++ b/src/CalendarMcp.Core/Models/OutboundEmailAttachment.cs
+@@ -34,6 +34,13 @@ public sealed class OutboundEmailAttachment
+     [JsonPropertyName("attachmentId")]
+     public string? AttachmentId { get; set; }
+ 
++    /// <summary>
++    /// A short-lived, run-scoped HTTP URL returned by Codex Gateway when
++    /// another MCP server supplies a binary resource.
++    /// </summary>
++    [JsonPropertyName("agentFileUrl")]
++    public string? AgentFileUrl { get; set; }
++
+     // Internal composition metadata. These members intentionally aren't
+     // public, so they don't become agent-controlled fields in the MCP schema.
+     internal bool IsInline { get; set; }
+diff --git a/src/CalendarMcp.Core/Services/GatewayAgentFileDownloader.cs b/src/CalendarMcp.Core/Services/GatewayAgentFileDownloader.cs
+new file mode 100644
+index 0000000..bfbbac1
+--- /dev/null
++++ b/src/CalendarMcp.Core/Services/GatewayAgentFileDownloader.cs
+@@ -0,0 +1,78 @@
++using System.Security.Cryptography;
++using CalendarMcp.Core.Models;
++using Microsoft.Extensions.Configuration;
++using ModelContextProtocol;
++
++namespace CalendarMcp.Core.Services;
++
++/// <summary>Downloads only short-lived files exposed by the configured Codex Gateway origin.</summary>
++public sealed class GatewayAgentFileDownloader(
++    IHttpClientFactory httpClientFactory,
++    IConfiguration configuration)
++{
++    private const long MaxAttachmentBytes = 25L * 1024 * 1024;
++    private const string RoutePrefix = "/_internal/mcp/artifacts/";
++
++    public async Task<OutboundEmailAttachment> DownloadAsync(OutboundEmailAttachment attachment)
++    {
++        var originText = configuration["CalendarMcp:AgentFileOrigin"];
++        if (!Uri.TryCreate(originText, UriKind.Absolute, out var origin) ||
++            origin.AbsolutePath != "/" ||
++            origin.Query.Length != 0 ||
++            origin.Fragment.Length != 0 ||
++            origin.UserInfo.Length != 0 ||
++            origin.Scheme is not ("http" or "https"))
++            throw new McpException("CalendarMcp:AgentFileOrigin must be configured before agentFileUrl can be used.");
++
++        if (!Uri.TryCreate(attachment.AgentFileUrl, UriKind.Absolute, out var url) ||
++            !string.Equals(url.GetLeftPart(UriPartial.Authority),
++                origin.GetLeftPart(UriPartial.Authority), StringComparison.OrdinalIgnoreCase) ||
++            url.UserInfo.Length != 0 ||
++            url.Query.Length != 0 ||
++            url.Fragment.Length != 0 ||
++            !url.AbsolutePath.StartsWith(RoutePrefix, StringComparison.Ordinal) ||
++            url.AbsolutePath[RoutePrefix.Length..] is not { Length: 43 } token ||
++            !token.All(character => char.IsAsciiLetterOrDigit(character) || character is '-' or '_'))
++            throw new McpException("agentFileUrl must be a run-scoped artifact URL on the configured Codex Gateway origin.");
++
++        using var response = await httpClientFactory.CreateClient("GatewayAgentFiles")
++            .GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
++        if (!response.IsSuccessStatusCode)
++            throw new McpException($"The agent file could not be downloaded (HTTP {(int)response.StatusCode}).");
++        if (response.Content.Headers.ContentLength is > MaxAttachmentBytes)
++            throw new McpException("The agent file exceeds the 25 MB attachment limit.");
++
++        await using var source = await response.Content.ReadAsStreamAsync();
++        await using var destination = new MemoryStream();
++        var buffer = new byte[64 * 1024];
++        int read;
++        while ((read = await source.ReadAsync(buffer)) > 0)
++        {
++            if (destination.Length + read > MaxAttachmentBytes)
++                throw new McpException("The agent file exceeds the 25 MB attachment limit.");
++            await destination.WriteAsync(buffer.AsMemory(0, read));
++        }
++
++        var bytes = destination.ToArray();
++        if (!response.Headers.TryGetValues("X-Content-SHA256", out var values) ||
++            !string.Equals(values.SingleOrDefault(),
++                Convert.ToHexStringLower(SHA256.HashData(bytes)), StringComparison.OrdinalIgnoreCase))
++            throw new McpException("The downloaded agent file failed its SHA-256 integrity check.");
++
++        var fileName = response.Content.Headers.ContentDisposition?.FileNameStar ??
++            response.Content.Headers.ContentDisposition?.FileName?.Trim('"');
++        var name = string.IsNullOrWhiteSpace(attachment.Name)
++            ? Path.GetFileName(fileName)
++            : attachment.Name;
++        if (string.IsNullOrWhiteSpace(name))
++            throw new McpException("The agent file has no attachment name.");
++
++        return new OutboundEmailAttachment
++        {
++            Name = name,
++            ContentType = attachment.ContentType ?? response.Content.Headers.ContentType?.MediaType ??
++                "application/octet-stream",
++            Base64Content = Convert.ToBase64String(bytes)
++        };
++    }
++}
+diff --git a/src/CalendarMcp.Core/Tools/SendEmailTool.cs b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+index 4ffc63d..dbf3e96 100644
+--- a/src/CalendarMcp.Core/Tools/SendEmailTool.cs
++++ b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+@@ -17,14 +17,15 @@ public sealed class SendEmailTool(
+     IProviderServiceFactory providerFactory,
+     IAttachmentStore attachmentStore,
+     IEmailCompositionService emailCompositionService,
+-    ILogger<SendEmailTool> logger)
++    ILogger<SendEmailTool> logger,
++    GatewayAgentFileDownloader? agentFileDownloader = null)
+ {
+     public SendEmailTool(
+         IAccountRegistry accountRegistry,
+         IProviderServiceFactory providerFactory,
+         IAttachmentStore attachmentStore,
+         ILogger<SendEmailTool> logger)
+-        : this(accountRegistry, providerFactory, attachmentStore, new EmailCompositionService(), logger)
++        : this(accountRegistry, providerFactory, attachmentStore, new EmailCompositionService(), logger, null)
+     {
+     }
+ 
+@@ -40,7 +41,7 @@ public sealed class SendEmailTool(
+         [Description("Account ID to send from. Omit to use smart routing (matches recipient domain to account domains, then falls back to first account). Obtain from list_accounts.")] string? accountId = null,
+         [Description("Body content format: 'html' (default), 'text', or 'multipart'. When 'multipart' is specified, provide textBody and htmlBody instead of body. Note: bodyFormat 'html' requires actual HTML markup; Markdown/plain text is not automatically converted to HTML.")] string bodyFormat = "html",
+         [Description("CC recipient email addresses")] List<string>? cc = null,
+-        [Description("Optional file attachments as a JSON array. Each item must set EITHER \"attachmentId\" (preferred for anything non-trivial: upload the file via POST /attachments first to get the ID) OR \"base64Content\" (the raw bytes encoded as base64; use only for very small files). \"name\" is required when using base64Content and optional when using attachmentId. \"contentType\" is optional. Total decoded payload per message must stay under 25 MB; Microsoft 365 and Outlook.com cap each individual attachment at 3 MB. Examples: [{\"attachmentId\":\"AbCd...\"}] or [{\"name\":\"x.pdf\",\"base64Content\":\"...\"}].")] List<OutboundEmailAttachment>? attachments = null,
++        [Description("Optional file attachments. Set exactly one of agentFileUrl (short-lived URL returned by another MCP tool through Codex Gateway; this server downloads the file directly), attachmentId (from POST /attachments), or base64Content (small files only). A file URL supplies its own name and contentType unless overridden. Total decoded payload must stay under 25 MB. Example: [{\"agentFileUrl\":\"http://gateway:8080/_internal/mcp/artifacts/...\"}].")] List<OutboundEmailAttachment>? attachments = null,
+         [Description("Plain-text body for multipart/alternative messages. Required when bodyFormat is 'multipart'.")] string? textBody = null,
+         [Description("HTML body for multipart/alternative messages. Required when bodyFormat is 'multipart'. Must contain actual HTML markup.")] string? htmlBody = null,
+         [Description("Append the configured signature of the sending account. Defaults to true. Set false only when the user explicitly requests an unsigned message.")] bool includeSignature = true)
+@@ -63,6 +64,30 @@ public sealed class SendEmailTool(
+         List<OutboundEmailAttachment>? resolvedAttachments = null;
+         if (attachments is { Count: > 0 })
+         {
++            if (attachments.Any(attachment => !string.IsNullOrWhiteSpace(attachment.AgentFileUrl)))
++            {
++                if (agentFileDownloader is null)
++                    throw new McpException("agentFileUrl is unavailable in this server configuration.");
++
++                var downloaded = new List<OutboundEmailAttachment>(attachments.Count);
++                foreach (var attachment in attachments)
++                {
++                    if (string.IsNullOrWhiteSpace(attachment.AgentFileUrl))
++                    {
++                        downloaded.Add(attachment);
++                        continue;
++                    }
++
++                    if (!string.IsNullOrWhiteSpace(attachment.AttachmentId) ||
++                        !string.IsNullOrWhiteSpace(attachment.Base64Content))
++                        throw new McpException("Set only one attachment source per item.");
++
++                    downloaded.Add(await agentFileDownloader.DownloadAsync(attachment));
++                }
++
++                attachments = downloaded;
++            }
++
+             var shapeError = ValidateAttachmentShapes(attachments);
+             if (shapeError != null)
+                 throw new McpException(shapeError);
+diff --git a/src/CalendarMcp.Tests/Tools/GatewayAgentFileDownloaderTests.cs b/src/CalendarMcp.Tests/Tools/GatewayAgentFileDownloaderTests.cs
+new file mode 100644
+index 0000000..2f13d8c
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Tools/GatewayAgentFileDownloaderTests.cs
+@@ -0,0 +1,109 @@
++using System.Net;
++using System.Net.Http.Headers;
++using System.Security.Cryptography;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using Microsoft.Extensions.Configuration;
++using ModelContextProtocol;
++
++namespace CalendarMcp.Tests.Tools;
++
++[TestClass]
++public sealed class GatewayAgentFileDownloaderTests
++{
++    private const string ArtifactUrl =
++        "http://gateway:8080/_internal/mcp/artifacts/abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO_0";
++
++    [TestMethod]
++    public async Task Downloads_verified_file_with_name_and_type_from_gateway()
++    {
++        var bytes = "PDF bytes"u8.ToArray();
++        var handler = new StubHandler(() =>
++        {
++            var response = new HttpResponseMessage(HttpStatusCode.OK)
++            {
++                Content = new ByteArrayContent(bytes)
++            };
++            response.Content.Headers.ContentType = new MediaTypeHeaderValue("application/pdf");
++            response.Content.Headers.ContentDisposition = new ContentDispositionHeaderValue("attachment")
++            {
++                FileNameStar = "invoice.pdf"
++            };
++            response.Headers.Add("X-Content-SHA256", Convert.ToHexStringLower(SHA256.HashData(bytes)));
++            return response;
++        });
++        var downloader = CreateDownloader(handler);
++
++        var result = await downloader.DownloadAsync(new OutboundEmailAttachment
++        {
++            AgentFileUrl = ArtifactUrl
++        });
++
++        Assert.AreEqual("invoice.pdf", result.Name);
++        Assert.AreEqual("application/pdf", result.ContentType);
++        CollectionAssert.AreEqual(bytes, Convert.FromBase64String(result.Base64Content!));
++        Assert.AreEqual(1, handler.CallCount);
++    }
++
++    [TestMethod]
++    public async Task Rejects_untrusted_origin_before_http_request()
++    {
++        var handler = new StubHandler(() => new HttpResponseMessage(HttpStatusCode.OK));
++        var downloader = CreateDownloader(handler);
++
++        await Assert.ThrowsExceptionAsync<McpException>(() => downloader.DownloadAsync(
++            new OutboundEmailAttachment
++            {
++                AgentFileUrl = ArtifactUrl.Replace("gateway:8080", "attacker.test")
++            }));
++
++        Assert.AreEqual(0, handler.CallCount);
++    }
++
++    [TestMethod]
++    public async Task Rejects_corrupt_file()
++    {
++        var handler = new StubHandler(() =>
++        {
++            var response = new HttpResponseMessage(HttpStatusCode.OK)
++            {
++                Content = new ByteArrayContent("tampered"u8.ToArray())
++            };
++            response.Headers.Add("X-Content-SHA256", new string('0', 64));
++            return response;
++        });
++        var downloader = CreateDownloader(handler);
++
++        await Assert.ThrowsExceptionAsync<McpException>(() => downloader.DownloadAsync(
++            new OutboundEmailAttachment { AgentFileUrl = ArtifactUrl }));
++    }
++
++    private static GatewayAgentFileDownloader CreateDownloader(HttpMessageHandler handler)
++    {
++        var client = new HttpClient(handler);
++        var configuration = new ConfigurationBuilder().AddInMemoryCollection(
++            new Dictionary<string, string?>
++            {
++                ["CalendarMcp:AgentFileOrigin"] = "http://gateway:8080"
++            }).Build();
++        return new GatewayAgentFileDownloader(new StubClientFactory(client), configuration);
++    }
++
++    private sealed class StubClientFactory(HttpClient client) : IHttpClientFactory
++    {
++        public HttpClient CreateClient(string name) => client;
++    }
++
++    private sealed class StubHandler(Func<HttpResponseMessage> responseFactory) : HttpMessageHandler
++    {
++        public int CallCount { get; private set; }
++
++        protected override Task<HttpResponseMessage> SendAsync(
++            HttpRequestMessage request,
++            CancellationToken cancellationToken)
++        {
++            CallCount++;
++            return Task.FromResult(responseFactory());
++        }
++    }
++}

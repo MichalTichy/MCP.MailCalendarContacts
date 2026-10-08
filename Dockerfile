@@ -15,6 +15,7 @@ COPY patches/save-draft.patch /tmp/save-draft.patch
 COPY patches/calendar-wall-time.patch /tmp/calendar-wall-time.patch
 COPY patches/agent-file.patch /tmp/agent-file.patch
 COPY patches/0001-Add-account-email-signatures-with-inline-images.patch /tmp/email-signatures.patch
+COPY patches/agent-file-http-transfer.patch /tmp/agent-file-http-transfer.patch
 RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check - \
     && apt-get update \
     && apt-get install --yes --no-install-recommends patch \
@@ -28,6 +29,7 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && patch --directory /source --strip=1 < /tmp/calendar-wall-time.patch \
     && patch --directory /source --strip=1 < /tmp/agent-file.patch \
     && patch --directory /source --strip=1 < /tmp/email-signatures.patch \
+    && patch --directory /source --strip=1 < /tmp/agent-file-http-transfer.patch \
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \

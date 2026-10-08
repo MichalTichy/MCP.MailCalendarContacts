@@ -61,6 +61,8 @@ Use **Test connection & discover tools** and select the tools that may be offere
 
 For a gateway running directly on the host, use `http://localhost:5051` instead of the Docker network address.
 
+Set `CalendarMcp:AgentFileOrigin` to the exact internal Gateway origin reachable from the mail container (the supplied Compose uses `http://gateway:8080`). Downloads from other origins, redirected URLs, and non-artifact paths are refused.
+
 ## Capability boundaries
 
 The server exposes 31 tools grouped by effect:
@@ -69,6 +71,7 @@ The server exposes 31 tools grouped by effect:
 - Mail read: listing, searching, details, contextual summaries, unsubscribe information, and attachments that can be stashed for outbound mail, returned inline for small clients, or exposed as an `agent_file` MCP resource for run-local inspection through Codex Gateway.
 - Mail management: read-state changes, moves, and deletion, including bulk variants.
 - Outbound mail: `send_email`, native-thread `reply_email`, non-sending `save_draft`, and `unsubscribe_from_email`. Ordinary sends, replies, and drafts append the selected account's configured signature by default; automated unsubscribe messages remain unsigned.
+- `send_email` accepts `attachments: [{"agentFileUrl":"..."}]` for files supplied by another MCP server in the same Codex Gateway run. The mail server fetches the file over private HTTP, verifies its SHA-256 digest, and sends it as a normal attachment. The URL expires with the run; PDF bytes and base64 do not pass through the model context.
 - Calendar read: calendars, events, and event details.
 - Calendar write: create, update, delete, and respond to events.
 - Contacts read: list, search, and details.
