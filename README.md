@@ -65,7 +65,7 @@ Set `CalendarMcp:AgentFileOrigin` to the exact internal Gateway origin reachable
 
 ## Capability boundaries
 
-The server exposes 31 tools grouped by effect:
+The server exposes 32 tools grouped by effect:
 
 - Discovery: account listing and usage guidance.
 - Mail read: listing, searching, details, contextual summaries, unsubscribe information, and attachments that can be stashed for outbound mail, returned inline for small clients, or exposed as an `agent_file` MCP resource for run-local inspection through Codex Gateway.
