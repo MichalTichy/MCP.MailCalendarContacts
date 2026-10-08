@@ -44,6 +44,8 @@ Each email-capable account can also define its own HTML signature, plain-text
 fallback, and inline PNG/JPEG/GIF images from the account editor. Signature
 images are embedded with MIME/Graph content IDs instead of remote URLs, and
 the complete configuration remains in the persistent data volume.
+Use HTML body format when the graphic signature is needed; plain-text messages
+receive a text-only fallback with image markup removed.
 
 Treat the persistent volume as a secret. On Linux, the current Microsoft token-cache implementation relies on owner-only file permissions rather than a host keyring.
 

@@ -1,0 +1,106 @@
+diff --git a/src/CalendarMcp.Core/Services/EmailCompositionService.cs b/src/CalendarMcp.Core/Services/EmailCompositionService.cs
+index bc2df34..93aaa16 100644
+--- a/src/CalendarMcp.Core/Services/EmailCompositionService.cs
++++ b/src/CalendarMcp.Core/Services/EmailCompositionService.cs
+@@ -82,9 +82,9 @@ public sealed class EmailCompositionService : IEmailCompositionService
+     }
+ 
+     private static string ResolveText(EmailSignature signature) =>
+-        !string.IsNullOrWhiteSpace(signature.Text)
+-            ? signature.Text.Trim()
+-            : StripHtml(signature.Html).Trim();
++        StripHtml(!string.IsNullOrWhiteSpace(signature.Text)
++            ? signature.Text
++            : signature.Html).Trim();
+ 
+     private static string AppendHtml(string body, string signature) =>
+         string.IsNullOrWhiteSpace(signature)
+diff --git a/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+index aff52bb..69055e7 100644
+--- a/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
++++ b/src/CalendarMcp.Core/Tools/ReplyEmailTool.cs
+@@ -29,8 +29,8 @@ public sealed class ReplyEmailTool(
+         [Description("Provider email ID of the message being answered.")] string emailId,
+         [Description("Reply body. Supply real HTML when bodyFormat is html; Markdown is not converted.")] string body,
+         [Description("Reply to all original participants instead of only the sender. Defaults to false.")] bool replyAll = false,
+-        [Description("Reply body format: html (default) or text.")] string bodyFormat = "html",
+-        [Description("Append the configured signature of this account. Defaults to true. Set false only when the user explicitly requests an unsigned reply.")] bool includeSignature = true)
++        [Description("Reply body format: html (default) or text. Use html for configured signatures with inline images; text uses a plain-text signature without images. HTML requires actual HTML markup.")] string bodyFormat = "html",
++        [Description("Append the configured signature of this account. Defaults to true. Do not duplicate its closing/sign-off in the body. Set false only when the user explicitly requests an unsigned reply.")] bool includeSignature = true)
+     {
+         if (string.IsNullOrWhiteSpace(accountId))
+             throw new McpException("accountId is required for reply_email.");
+diff --git a/src/CalendarMcp.Core/Tools/SaveDraftTool.cs b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+index c37df76..82e8aee 100644
+--- a/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
++++ b/src/CalendarMcp.Core/Tools/SaveDraftTool.cs
+@@ -29,11 +29,11 @@ public sealed class SaveDraftTool(
+         [Description("Draft body. Supply real HTML when bodyFormat is html; Markdown is not converted.")] string body,
+         [Description("Recipients for a new message. Required unless replyToEmailId is provided.")] List<string>? to = null,
+         [Description("Subject for a new message. Required unless replyToEmailId is provided.")] string? subject = null,
+-        [Description("Draft body format: html (default) or text.")] string bodyFormat = "html",
++        [Description("Draft body format: html (default) or text. Use html for configured signatures with inline images; text uses a plain-text signature without images. HTML requires actual HTML markup.")] string bodyFormat = "html",
+         [Description("Optional CC recipients for a new message. Reply drafts derive CC recipients from the original message when replyAll is true.")] List<string>? cc = null,
+         [Description("Provider email ID of the message being answered. Obtain from get_emails, search_emails, or get_email_details. Omit when composing a new message.")] string? replyToEmailId = null,
+         [Description("For a reply draft, include all original participants instead of only the sender. Ignored for a new message.")] bool replyAll = false,
+-        [Description("Append the configured signature of this account. Defaults to true. Set false only when the user explicitly requests an unsigned draft.")] bool includeSignature = true)
++        [Description("Append the configured signature of this account. Defaults to true. Do not duplicate its closing/sign-off in the body. Set false only when the user explicitly requests an unsigned draft.")] bool includeSignature = true)
+     {
+         if (string.IsNullOrWhiteSpace(accountId))
+             throw new McpException("accountId is required for save_draft.");
+diff --git a/src/CalendarMcp.Core/Tools/SendEmailTool.cs b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+index dbf3e96..470e12f 100644
+--- a/src/CalendarMcp.Core/Tools/SendEmailTool.cs
++++ b/src/CalendarMcp.Core/Tools/SendEmailTool.cs
+@@ -39,12 +39,12 @@ public sealed class SendEmailTool(
+         [Description("Email subject line")] string subject,
+         [Description("Email body content. Use HTML when bodyFormat is 'html' (the default). Ignored when bodyFormat is 'multipart'.")] string body = "",
+         [Description("Account ID to send from. Omit to use smart routing (matches recipient domain to account domains, then falls back to first account). Obtain from list_accounts.")] string? accountId = null,
+-        [Description("Body content format: 'html' (default), 'text', or 'multipart'. When 'multipart' is specified, provide textBody and htmlBody instead of body. Note: bodyFormat 'html' requires actual HTML markup; Markdown/plain text is not automatically converted to HTML.")] string bodyFormat = "html",
++        [Description("Body content format: 'html' (default), 'text', or 'multipart'. Use html for configured signatures with inline images; text uses a plain-text signature without images. For multipart, provide textBody and htmlBody instead of body. HTML requires actual HTML markup; Markdown/plain text is not automatically converted.")] string bodyFormat = "html",
+         [Description("CC recipient email addresses")] List<string>? cc = null,
+         [Description("Optional file attachments. Set exactly one of agentFileUrl (short-lived URL returned by another MCP tool through Codex Gateway; this server downloads the file directly), attachmentId (from POST /attachments), or base64Content (small files only). A file URL supplies its own name and contentType unless overridden. Total decoded payload must stay under 25 MB. Example: [{\"agentFileUrl\":\"http://gateway:8080/_internal/mcp/artifacts/...\"}].")] List<OutboundEmailAttachment>? attachments = null,
+         [Description("Plain-text body for multipart/alternative messages. Required when bodyFormat is 'multipart'.")] string? textBody = null,
+         [Description("HTML body for multipart/alternative messages. Required when bodyFormat is 'multipart'. Must contain actual HTML markup.")] string? htmlBody = null,
+-        [Description("Append the configured signature of the sending account. Defaults to true. Set false only when the user explicitly requests an unsigned message.")] bool includeSignature = true)
++        [Description("Append the configured signature of the sending account. Defaults to true. Do not duplicate the account signature's closing/sign-off in the body. Set false only when the user explicitly requests an unsigned message.")] bool includeSignature = true)
+     {
+         // Strip CDATA wrappers if present (LLMs sometimes wrap content in XML CDATA)
+         body = StripCdataWrapper(body);
+diff --git a/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs b/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
+index 2134fb4..a2daf0a 100644
+--- a/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
++++ b/src/CalendarMcp.Tests/Services/EmailCompositionServiceTests.cs
+@@ -52,6 +52,32 @@ public class EmailCompositionServiceTests
+         Assert.IsTrue(result.SignatureApplied);
+     }
+ 
++    [TestMethod]
++    public void Compose_Text_StripsEmbeddedImageMarkupFromConfiguredTextSignature()
++    {
++        var account = TestData.CreateAccount(emailSignature: new EmailSignature
++        {
++            Enabled = true,
++            Text = "Best regards\nMichal<img src=\"cid:logo\" alt=\"\">",
++            Images =
++            [
++                new EmailSignatureImage
++                {
++                    ContentId = "logo",
++                    Name = "logo.png",
++                    ContentType = "image/png",
++                    Base64Content = Convert.ToBase64String([1, 2, 3])
++                }
++            ]
++        });
++
++        var result = _service.Compose(account, "Hello", "text");
++
++        Assert.AreEqual("Hello\r\n\r\n-- \r\nBest regards\nMichal", result.Body);
++        Assert.IsNull(result.Attachments);
++        Assert.IsFalse(result.Body.Contains("cid:", StringComparison.OrdinalIgnoreCase));
++    }
++
+     [TestMethod]
+     public void Compose_Multipart_AppendsBothVariants()
+     {
