@@ -1,0 +1,457 @@
+diff --git a/src/CalendarMcp.Core/Models/CalendarEvent.cs b/src/CalendarMcp.Core/Models/CalendarEvent.cs
+index d8200f1..9c7a821 100644
+--- a/src/CalendarMcp.Core/Models/CalendarEvent.cs
++++ b/src/CalendarMcp.Core/Models/CalendarEvent.cs
+@@ -81,9 +81,9 @@ public class CalendarEvent
+     public string ResponseStatus { get; init; } = "notResponded";
+     
+     /// <summary>
+-    /// Free/busy status: "free", "tentative", "busy", "outOfOffice", "workingElsewhere"
++    /// Free/busy status: "free", "tentative", "busy", "outOfOffice", "workingElsewhere", or "unknown" when unavailable
+     /// </summary>
+-    public string ShowAs { get; init; } = "busy";
++    public string ShowAs { get; init; } = "unknown";
+     
+     /// <summary>
+     /// Event sensitivity: "normal", "private", "personal", "confidential"
+diff --git a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+index cf51325..762f9b7 100644
+--- a/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/GoogleProviderService.cs
+@@ -878,7 +878,9 @@ public class GoogleProviderService : IGoogleProviderService
+                 Organizer = evt.Organizer?.Email ?? string.Empty,
+                 Attendees = evt.Attendees?.Select(a => a.Email ?? string.Empty).ToList() ?? [],
+                 IsAllDay = !string.IsNullOrEmpty(evt.Start?.Date),
+-                ResponseStatus = MapGoogleResponseStatus(evt.Attendees?.FirstOrDefault(a => a.Self == true)?.ResponseStatus)
++                ResponseStatus = MapGoogleResponseStatus(evt.Attendees?.FirstOrDefault(a => a.Self == true)?.ResponseStatus),
++                ShowAs = MapGoogleTransparency(evt.Transparency),
++                IsCancelled = evt.Status == "cancelled"
+             }).ToList();
+ 
+             _logger.LogInformation("Retrieved {Count} events from Google account {AccountId}", result.Count, accountId);
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+index afd523d..b33bc48 100644
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -20,12 +20,24 @@ public class M365ProviderService : IM365ProviderService
+     private readonly ILogger<M365ProviderService> _logger;
+     private readonly IM365AuthenticationService _authService;
+     private readonly IAccountRegistry _accountRegistry;
++    private readonly Func<string, GraphServiceClient> _calendarClientFactory;
+ 
+     public M365ProviderService(
+         ILogger<M365ProviderService> logger,
+         IM365AuthenticationService authService,
+         IAccountRegistry accountRegistry)
++        : this(logger, authService, accountRegistry,
++            token => new GraphServiceClient(new BearerTokenAuthenticationProvider(token)))
+     {
++    }
++
++    internal M365ProviderService(
++        ILogger<M365ProviderService> logger,
++        IM365AuthenticationService authService,
++        IAccountRegistry accountRegistry,
++        Func<string, GraphServiceClient> calendarClientFactory)
++    {
++        _calendarClientFactory = calendarClientFactory;
+         _logger = logger;
+         _authService = authService;
+         _accountRegistry = accountRegistry;
+@@ -734,8 +746,7 @@ public class M365ProviderService : IM365ProviderService
+ 
+         try
+         {
+-            var authProvider = new BearerTokenAuthenticationProvider(token);
+-            var graphClient = new GraphServiceClient(authProvider);
++            var graphClient = _calendarClientFactory(token);
+ 
+             // Default to today and next 30 days if not specified
+             var start = startDate ?? DateTime.UtcNow.Date;
+@@ -755,7 +766,7 @@ public class M365ProviderService : IM365ProviderService
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
+                 }, cancellationToken);
+             }
+             else
+@@ -767,7 +778,7 @@ public class M365ProviderService : IM365ProviderService
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
+                 }, cancellationToken);
+             }
+ 
+@@ -789,7 +800,9 @@ public class M365ProviderService : IM365ProviderService
+                         Organizer = evt.Organizer?.EmailAddress?.Address ?? string.Empty,
+                         Attendees = evt.Attendees?.Select(a => a.EmailAddress?.Address ?? string.Empty).ToList() ?? [],
+                         IsAllDay = evt.IsAllDay ?? false,
+-                        ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response)
++                        ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response),
++                        ShowAs = MapShowAs(evt.ShowAs),
++                        IsCancelled = evt.IsCancelled ?? false
+                     });
+                 }
+             }
+@@ -818,8 +831,7 @@ public class M365ProviderService : IM365ProviderService
+ 
+         try
+         {
+-            var authProvider = new BearerTokenAuthenticationProvider(token);
+-            var graphClient = new GraphServiceClient(authProvider);
++            var graphClient = _calendarClientFactory(token);
+ 
+             Event? evt;
+             if (string.IsNullOrEmpty(calendarId) || calendarId == "primary")
+@@ -963,7 +975,7 @@ public class M365ProviderService : IM365ProviderService
+             FreeBusyStatus.Busy => "busy",
+             FreeBusyStatus.Oof => "outOfOffice",
+             FreeBusyStatus.WorkingElsewhere => "workingElsewhere",
+-            _ => "busy"
++            _ => "unknown"
+         };
+     }
+ 
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+index 53c2640..c3b79cb 100644
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -21,12 +21,24 @@ public class OutlookComProviderService : IOutlookComProviderService
+     private readonly ILogger<OutlookComProviderService> _logger;
+     private readonly IM365AuthenticationService _authService;
+     private readonly IAccountRegistry _accountRegistry;
++    private readonly Func<string, GraphServiceClient> _calendarClientFactory;
+ 
+     public OutlookComProviderService(
+         ILogger<OutlookComProviderService> logger,
+         IM365AuthenticationService authService,
+         IAccountRegistry accountRegistry)
++        : this(logger, authService, accountRegistry,
++            token => new GraphServiceClient(new BearerTokenAuthenticationProvider(token)))
+     {
++    }
++
++    internal OutlookComProviderService(
++        ILogger<OutlookComProviderService> logger,
++        IM365AuthenticationService authService,
++        IAccountRegistry accountRegistry,
++        Func<string, GraphServiceClient> calendarClientFactory)
++    {
++        _calendarClientFactory = calendarClientFactory;
+         _logger = logger;
+         _authService = authService;
+         _accountRegistry = accountRegistry;
+@@ -716,8 +728,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+ 
+         try
+         {
+-            var authProvider = new BearerTokenAuthenticationProvider(token);
+-            var graphClient = new GraphServiceClient(authProvider);
++            var graphClient = _calendarClientFactory(token);
+ 
+             // Default to today and next 30 days if not specified
+             var start = startDate ?? DateTime.UtcNow.Date;
+@@ -735,7 +746,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
+                 }, cancellationToken);
+             }
+             else
+@@ -746,7 +757,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
+                 }, cancellationToken);
+             }
+ 
+@@ -768,7 +779,9 @@ public class OutlookComProviderService : IOutlookComProviderService
+                         Organizer = evt.Organizer?.EmailAddress?.Address ?? string.Empty,
+                         Attendees = evt.Attendees?.Select(a => a.EmailAddress?.Address ?? string.Empty).ToList() ?? [],
+                         IsAllDay = evt.IsAllDay ?? false,
+-                        ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response)
++                        ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response),
++                        ShowAs = MapShowAs(evt.ShowAs),
++                        IsCancelled = evt.IsCancelled ?? false
+                     });
+                 }
+             }
+@@ -797,8 +810,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+ 
+         try
+         {
+-            var authProvider = new BearerTokenAuthenticationProvider(token);
+-            var graphClient = new GraphServiceClient(authProvider);
++            var graphClient = _calendarClientFactory(token);
+ 
+             Event? evt;
+             if (string.IsNullOrEmpty(calendarId) || calendarId == "primary")
+@@ -942,7 +954,7 @@ public class OutlookComProviderService : IOutlookComProviderService
+             FreeBusyStatus.Busy => "busy",
+             FreeBusyStatus.Oof => "outOfOffice",
+             FreeBusyStatus.WorkingElsewhere => "workingElsewhere",
+-            _ => "busy"
++            _ => "unknown"
+         };
+     }
+ 
+diff --git a/src/CalendarMcp.Core/Skills/calendar.md b/src/CalendarMcp.Core/Skills/calendar.md
+index 8a09eb0..23c1b4f 100644
+--- a/src/CalendarMcp.Core/Skills/calendar.md
++++ b/src/CalendarMcp.Core/Skills/calendar.md
+@@ -40,7 +40,25 @@ used.
+ 
+ Returns events sorted by start time, each with `id, accountId,
+ calendarId, subject, start_utc/start_local, end_utc/end_local,
+-location, attendees, isAllDay, organizer`.
++location, attendees, isAllDay, organizer, showAs, isCancelled, responseStatus`.
++
++### Availability and "Show as"
++
++Both list and detail reads expose `showAs`: `free`, `tentative`, `busy`,
++`outOfOffice`, `workingElsewhere`, or `unknown` when the provider did not
++supply a usable value. Microsoft 365 and Outlook.com preserve Graph's
++availability; Google transparency, iCalendar TRANSP, and JSON showAs use
++the corresponding provider semantics.
++
++A `free` event does not block a meeting even when it is all-day. A cancelled
++event (`isCancelled=true`) does not block either. Presence on the calendar,
++its title, and all-day duration alone do not establish unavailability.
++Assess tentative events and working-elsewhere locations in context.
++
++For `unknown`, retrieve the exact occurrence's details or ask about a
++material unresolved conflict; never report an invented `busy` status or
++assume unknown means free. Use `responseStatus` to distinguish attendance
++responses from the separate availability and cancellation fields.
+ 
+ ### `get_calendar_event_details(accountId, calendarId, eventId, timeZone)`
+ 
+diff --git a/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs b/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
+index 1a78007..5b38a47 100644
+--- a/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
++++ b/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
+@@ -18,7 +18,7 @@ public sealed class GetCalendarEventsTool(
+     IProviderServiceFactory providerFactory,
+     ILogger<GetCalendarEventsTool> logger)
+ {
+-    [McpServerTool, Description("Get calendar events for a date range from one or all accounts. The timeZone parameter is required. Omit accountId (and calendarId) to query all enabled accounts at once; provide accountId to scope to one account, or provide calendarId alone to resolve the account automatically when it uniquely identifies a single account. Returns events sorted by start time, each with: id, accountId, calendarId, subject, start/end in both UTC and local time, timezone, location, attendees, isAllDay, organizer. Use the returned accountId and id when calling delete_event, respond_to_event, or get_calendar_event_details.")]
++    [McpServerTool, Description("Get calendar events for a date range from one or all accounts. The timeZone parameter is required. Omit accountId (and calendarId) to query all enabled accounts at once; provide accountId to scope to one account, or provide calendarId alone to resolve the account automatically when it uniquely identifies a single account. Returns events sorted by start time, each with: id, accountId, calendarId, subject, start/end in both UTC and local time, timezone, location, attendees, isAllDay, organizer, showAs, isCancelled, responseStatus. Free or cancelled events do not block availability; unknown availability needs verification. Use the returned accountId and id when calling delete_event, respond_to_event, or get_calendar_event_details.")]
+     public async Task<string> GetCalendarEvents(
+         [Description("IANA timezone name for displaying event times (e.g. `America/Chicago`, `America/New_York`, `Europe/London`, `Asia/Tokyo`). All event times are returned in both UTC and this local timezone. Required.")] string timeZone,
+         [Description("Start of the date range (ISO 8601 format, e.g. `2026-02-20`). Defaults to today.")] DateTime? startDate = null,
+@@ -214,6 +214,9 @@ public sealed class GetCalendarEventsTool(
+                     location = e.Location,
+                     attendees = e.Attendees,
+                     isAllDay = e.IsAllDay,
++                    showAs = e.ShowAs,
++                    isCancelled = e.IsCancelled,
++                    responseStatus = e.ResponseStatus,
+                     organizer = e.Organizer
+                 }),
+                 warnings = warnings.Count > 0 ? warnings : null
+diff --git a/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs b/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs
+new file mode 100644
+index 0000000..273560d
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs
+@@ -0,0 +1,103 @@
++using System.Net;
++using System.Text;
++using System.Text.Json;
++using System.Web;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Providers;
++using CalendarMcp.Core.Services;
++using CalendarMcp.Tests.Helpers;
++using Microsoft.Extensions.Logging.Abstractions;
++using Microsoft.Graph;
++using Microsoft.Kiota.Abstractions.Authentication;
++using Rocks;
++
++namespace CalendarMcp.Tests.Providers;
++
++[TestClass]
++public sealed class GraphCalendarAvailabilityTests
++{
++    [TestMethod]
++    [DataRow("microsoft365", "primary")]
++    [DataRow("microsoft365", "named-calendar")]
++    [DataRow("outlook.com", "primary")]
++    [DataRow("outlook.com", "named-calendar")]
++    public async Task ListAndDetailPreserveAvailabilityFromGraph(string providerName, string calendarId)
++    {
++        (string? GraphValue, string Expected)[] cases =
++        [
++            ("free", "free"), ("busy", "busy"), ("tentative", "tentative"),
++            ("oof", "outOfOffice"), ("workingElsewhere", "workingElsewhere"),
++            ("unknown", "unknown"), (null, "unknown")
++        ];
++
++        foreach (var (graphValue, expected) in cases)
++        {
++            var account = TestData.CreateAccount(provider: providerName,
++                providerConfig: new() { ["tenantId"] = "test-tenant", ["clientId"] = "test-client" });
++            var registry = new IAccountRegistryCreateExpectations();
++            registry.Setups.GetAccountAsync(account.Id)
++                .ReturnValue(Task.FromResult<AccountInfo?>(account)).ExpectedCallCount(2);
++            var auth = new IM365AuthenticationServiceCreateExpectations();
++            auth.Setups.GetTokenSilentlyAsync("test-tenant", "test-client", Arg.Any<string[]>(),
++                    account.Id, Arg.Any<CancellationToken>())
++                .ReturnValue(Task.FromResult<string?>("unit-test-token")).ExpectedCallCount(2);
++            using var handler = new CalendarHandler(graphValue);
++            using var http = new HttpClient(handler);
++            using var graph = new GraphServiceClient(http, new AnonymousAuthenticationProvider());
++            IProviderService provider = providerName == "microsoft365"
++                ? new M365ProviderService(NullLogger<M365ProviderService>.Instance,
++                    auth.Instance(), registry.Instance(), _ => graph)
++                : new OutlookComProviderService(NullLogger<OutlookComProviderService>.Instance,
++                    auth.Instance(), registry.Instance(), _ => graph);
++
++            var events = (await provider.GetCalendarEventsAsync(account.Id, calendarId,
++                new DateTime(2026, 11, 5), new DateTime(2026, 11, 6))).ToArray();
++            Assert.AreEqual(1, events.Length, $"Calendar list lost the {graphValue ?? "missing"} event");
++            var detail = await provider.GetCalendarEventDetailsAsync(account.Id, calendarId, "workout");
++            Assert.IsNotNull(detail);
++
++            foreach (var item in new[] { events[0], detail })
++            {
++                Assert.AreEqual(expected, item.ShowAs, "Provider availability must survive mapping");
++                Assert.IsTrue(item.IsAllDay);
++                Assert.IsTrue(item.IsCancelled, "Cancellation must survive list and detail reads");
++                Assert.AreEqual("declined", item.ResponseStatus);
++            }
++            Assert.AreEqual(2, handler.Requests);
++            registry.Verify();
++            auth.Verify();
++        }
++    }
++
++    private sealed class CalendarHandler(string? showAs) : HttpMessageHandler
++    {
++        public int Requests { get; private set; }
++
++        protected override Task<HttpResponseMessage> SendAsync(
++            HttpRequestMessage request, CancellationToken cancellationToken)
++        {
++            Requests++;
++            var uri = request.RequestUri!;
++            var fields = HttpUtility.ParseQueryString(uri.Query)["$select"]?.Split(',') ?? [];
++            foreach (var required in new[] { "showAs", "isCancelled", "responseStatus" })
++                Assert.IsTrue(fields.Contains(required), $"Graph request must select {required}");
++
++            var evt = new Dictionary<string, object?>
++            {
++                ["id"] = "workout", ["subject"] = "Informational workout",
++                ["start"] = new { dateTime = "2026-11-05T00:00:00", timeZone = "UTC" },
++                ["end"] = new { dateTime = "2026-11-06T00:00:00", timeZone = "UTC" },
++                ["isAllDay"] = true, ["isCancelled"] = true,
++                ["responseStatus"] = new { response = "declined" }
++            };
++            if (showAs != null)
++                evt["showAs"] = showAs;
++            object payload = uri.AbsolutePath.EndsWith("calendarView", StringComparison.Ordinal)
++                ? new { value = new[] { evt } } : evt;
++            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
++            {
++                Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json")
++            });
++        }
++    }
++}
+diff --git a/src/CalendarMcp.Tests/RockSetup.cs b/src/CalendarMcp.Tests/RockSetup.cs
+index 0c58e1f..b3a5794 100644
+--- a/src/CalendarMcp.Tests/RockSetup.cs
++++ b/src/CalendarMcp.Tests/RockSetup.cs
+@@ -10,3 +10,5 @@ using Rocks;
+ [assembly: Rock(typeof(IIcsProviderService), BuildType.Create)]
+ [assembly: Rock(typeof(IJsonCalendarProviderService), BuildType.Create)]
+ [assembly: Rock(typeof(IImapProviderService), BuildType.Create)]
++
++[assembly: Rock(typeof(IM365AuthenticationService), BuildType.Create)]
+diff --git a/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs b/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs
+new file mode 100644
+index 0000000..bf433f8
+--- /dev/null
++++ b/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs
+@@ -0,0 +1,73 @@
++using System.Text.Json;
++using CalendarMcp.Core.Models;
++using CalendarMcp.Core.Services;
++using CalendarMcp.Core.Tools;
++using CalendarMcp.Tests.Helpers;
++using Microsoft.Extensions.Logging.Abstractions;
++using Rocks;
++
++namespace CalendarMcp.Tests.Tools;
++
++[TestClass]
++public sealed class CalendarAvailabilityOutputTests
++{
++    [TestMethod]
++    [DataRow("free", false)]
++    [DataRow("busy", false)]
++    [DataRow("tentative", false)]
++    [DataRow("outOfOffice", false)]
++    [DataRow("workingElsewhere", false)]
++    [DataRow("unknown", false)]
++    [DataRow("free", true)]
++    public async Task AllDayAvailabilityIsReturnedConsistentlyByListAndDetail(string showAs, bool cancelled)
++    {
++        var account = TestData.CreateAccount();
++        var evt = new CalendarEvent
++        {
++            Id = "workout", AccountId = account.Id, CalendarId = "primary", Subject = "Workout",
++            Start = new DateTimeOffset(2026, 11, 5, 0, 0, 0, TimeSpan.Zero),
++            End = new DateTimeOffset(2026, 11, 6, 0, 0, 0, TimeSpan.Zero),
++            IsAllDay = true, ShowAs = showAs, IsCancelled = cancelled, ResponseStatus = "declined"
++        };
++        var registry = new IAccountRegistryCreateExpectations();
++        registry.Setups.GetAccountAsync(account.Id)
++            .ReturnValue(Task.FromResult<AccountInfo?>(account)).ExpectedCallCount(2);
++        var provider = new IProviderServiceCreateExpectations();
++        provider.Setups.GetCalendarEventsAsync(account.Id, "primary", Arg.Any<DateTime?>(),
++                Arg.Any<DateTime?>(), Arg.Any<int>(), Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult<IEnumerable<CalendarEvent>>([evt]));
++        provider.Setups.GetCalendarEventDetailsAsync(account.Id, "primary", evt.Id, Arg.Any<CancellationToken>())
++            .ReturnValue(Task.FromResult<CalendarEvent?>(evt));
++        var factory = new IProviderServiceFactoryCreateExpectations();
++        factory.Setups.GetProvider(account.Provider).ReturnValue(provider.Instance()).ExpectedCallCount(2);
++        var registryInstance = registry.Instance();
++        var factoryInstance = factory.Instance();
++        var list = new GetCalendarEventsTool(registryInstance, factoryInstance,
++            NullLogger<GetCalendarEventsTool>.Instance);
++        var detail = new GetCalendarEventDetailsTool(registryInstance, factoryInstance,
++            NullLogger<GetCalendarEventDetailsTool>.Instance);
++
++        using var listJson = JsonDocument.Parse(await list.GetCalendarEvents("Europe/Prague",
++            new DateTime(2026, 11, 5), new DateTime(2026, 11, 6), account.Id, "primary"));
++        using var detailJson = JsonDocument.Parse(await detail.GetCalendarEventDetails(
++            "Europe/Prague", account.Id, "primary", evt.Id));
++
++        foreach (var item in new[] { listJson.RootElement.GetProperty("events")[0], detailJson.RootElement })
++        {
++            Assert.AreEqual(showAs, item.GetProperty("showAs").GetString());
++            Assert.AreEqual(cancelled, item.GetProperty("isCancelled").GetBoolean());
++            Assert.AreEqual("declined", item.GetProperty("responseStatus").GetString());
++            Assert.IsTrue(item.GetProperty("isAllDay").GetBoolean());
++        }
++        registry.Verify();
++        provider.Verify();
++        factory.Verify();
++    }
++
++    [TestMethod]
++    public void MissingAvailabilityIsUnknownRatherThanBusy()
++    {
++        var evt = TestData.CreateEvent();
++        Assert.AreEqual("unknown", evt.ShowAs);
++    }
++}

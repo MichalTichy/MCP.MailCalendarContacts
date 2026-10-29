@@ -18,6 +18,7 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
 - Account configuration, OAuth caches, and protected IMAP/SMTP credentials remain in a dedicated volume.
 - The UI binds to loopback by default, and the container joins the gateway backend network rather than its runner network.
 - Calendar create/update normalizes offset-aware input into the requested calendar time zone before writing, while preserving offset-free local times.
+- Calendar list and detail reads expose `showAs`, `isCancelled`, and `responseStatus`. Microsoft 365/Outlook.com availability and Google transparency survive list mapping; missing Microsoft availability is `unknown`, never an invented `busy`. Free and cancelled entries do not block scheduling, including all-day entries.
 
 Codex Gateway provides the tool-authorization layer: each API key/project grant selects exact MCP tools, and its run-scoped relay rejects calls to tools outside that selection.
 
@@ -37,6 +38,8 @@ docker compose up -d
 ```
 
 Use `docker compose up --build -d` instead when validating the pinned upstream source and local patch.
+
+Run the patched upstream test suite, including Graph availability and MCP-output regressions, with `docker build --target test .`. These tests use simulated Graph responses and do not access live accounts.
 
 Open `http://localhost:5051/admin/ui` and authenticate with `MAIL_CALENDAR_CONTACTS_MCP_ADMIN_TOKEN` to configure provider accounts.
 

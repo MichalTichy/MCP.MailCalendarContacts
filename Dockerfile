@@ -18,6 +18,7 @@ COPY patches/0001-Add-account-email-signatures-with-inline-images.patch /tmp/ema
 COPY patches/agent-file-http-transfer.patch /tmp/agent-file-http-transfer.patch
 COPY patches/attach-to-draft.patch /tmp/attach-to-draft.patch
 COPY patches/signature-text-format.patch /tmp/signature-text-format.patch
+COPY patches/calendar-availability.patch /tmp/calendar-availability.patch
 RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check - \
     && apt-get update \
     && apt-get install --yes --no-install-recommends patch \
@@ -34,10 +35,15 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && patch --directory /source --strip=1 < /tmp/agent-file-http-transfer.patch \
     && patch --directory /source --strip=1 < /tmp/attach-to-draft.patch \
     && patch --directory /source --strip=1 < /tmp/signature-text-format.patch \
+    && patch --directory /source --strip=1 < /tmp/calendar-availability.patch \
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \
         /p:UseAppHost=true
+
+FROM build AS test
+RUN dotnet test /source/src/CalendarMcp.Tests/CalendarMcp.Tests.csproj \
+    --configuration Release --verbosity minimal
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0.9-noble
 WORKDIR /app
