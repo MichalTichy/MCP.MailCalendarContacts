@@ -1,0 +1,366 @@
+diff --git a/src/CalendarMcp.Core/Models/CalendarEvent.cs b/src/CalendarMcp.Core/Models/CalendarEvent.cs
+--- a/src/CalendarMcp.Core/Models/CalendarEvent.cs
++++ b/src/CalendarMcp.Core/Models/CalendarEvent.cs
+@@ -114,6 +114,27 @@
+     /// Whether this is a recurring event
+     /// </summary>
+     public bool IsRecurring { get; init; }
++
++    /// <summary>
++    /// Provider event type, such as singleInstance, occurrence, exception, or seriesMaster.
++    /// Null when the provider does not supply this metadata.
++    /// </summary>
++    public string? EventType { get; init; }
++
++    /// <summary>
++    /// Exact provider ID of the recurring series master, if this is an occurrence or exception.
++    /// </summary>
++    public string? SeriesMasterId { get; init; }
++
++    /// <summary>
++    /// Provider iCalendar UID, useful when comparing copies in different calendars.
++    /// </summary>
++    public string? ICalUId { get; init; }
++
++    /// <summary>
++    /// Provider link to this exact event in its calendar application.
++    /// </summary>
++    public string? WebLink { get; init; }
+     
+     /// <summary>
+     /// Recurrence pattern description (e.g., "Every weekday", "Weekly on Monday")
+diff --git a/src/CalendarMcp.Core/Providers/M365ProviderService.cs b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+--- a/src/CalendarMcp.Core/Providers/M365ProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/M365ProviderService.cs
+@@ -766,7 +766,7 @@
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled", "type", "seriesMasterId", "iCalUId", "webLink"];
+                 }, cancellationToken);
+             }
+             else
+@@ -778,7 +778,7 @@
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled", "type", "seriesMasterId", "iCalUId", "webLink"];
+                 }, cancellationToken);
+             }
+ 
+@@ -802,7 +802,12 @@
+                         IsAllDay = evt.IsAllDay ?? false,
+                         ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response),
+                         ShowAs = MapShowAs(evt.ShowAs),
+-                        IsCancelled = evt.IsCancelled ?? false
++                        IsCancelled = evt.IsCancelled ?? false,
++                        IsRecurring = IsRecurringEvent(evt),
++                        EventType = MapEventType(evt.Type),
++                        SeriesMasterId = evt.SeriesMasterId,
++                        ICalUId = evt.ICalUId,
++                        WebLink = evt.WebLink
+                     });
+                 }
+             }
+@@ -842,7 +847,8 @@
+                         "id", "subject", "start", "end", "location", "body", "organizer", 
+                         "attendees", "isAllDay", "responseStatus", "showAs", "sensitivity",
+                         "isCancelled", "isOnlineMeeting", "onlineMeetingUrl", "onlineMeeting",
+-                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime"
++                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime",
++                        "type", "seriesMasterId", "iCalUId", "webLink"
+                     ];
+                 }, cancellationToken);
+             }
+@@ -854,7 +860,8 @@
+                         "id", "subject", "start", "end", "location", "body", "organizer", 
+                         "attendees", "isAllDay", "responseStatus", "showAs", "sensitivity",
+                         "isCancelled", "isOnlineMeeting", "onlineMeetingUrl", "onlineMeeting",
+-                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime"
++                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime",
++                        "type", "seriesMasterId", "iCalUId", "webLink"
+                     ];
+                 }, cancellationToken);
+             }
+@@ -896,7 +903,11 @@
+                 IsOnlineMeeting = evt.IsOnlineMeeting ?? false,
+                 OnlineMeetingUrl = evt.OnlineMeetingUrl ?? evt.OnlineMeeting?.JoinUrl,
+                 OnlineMeetingProvider = evt.IsOnlineMeeting == true ? "teamsForBusiness" : null,
+-                IsRecurring = evt.Recurrence != null,
++                IsRecurring = IsRecurringEvent(evt),
++                EventType = MapEventType(evt.Type),
++                SeriesMasterId = evt.SeriesMasterId,
++                ICalUId = evt.ICalUId,
++                WebLink = evt.WebLink,
+                 RecurrencePattern = FormatRecurrencePattern(evt.Recurrence),
+                 Categories = evt.Categories?.ToList() ?? [],
+                 Importance = MapImportance(evt.Importance),
+@@ -965,6 +976,20 @@
+             _ => "required"
+         };
+     }
++
++    private static bool IsRecurringEvent(Event evt) =>
++        evt.Type is EventType.Occurrence or EventType.Exception or EventType.SeriesMaster
++        || !string.IsNullOrEmpty(evt.SeriesMasterId)
++        || evt.Recurrence != null;
++
++    private static string? MapEventType(EventType? type) => type switch
++    {
++        EventType.SingleInstance => "singleInstance",
++        EventType.Occurrence => "occurrence",
++        EventType.Exception => "exception",
++        EventType.SeriesMaster => "seriesMaster",
++        _ => null
++    };
+ 
+     private static string MapShowAs(FreeBusyStatus? showAs)
+     {
+diff --git a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+--- a/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
++++ b/src/CalendarMcp.Core/Providers/OutlookComProviderService.cs
+@@ -746,7 +746,7 @@
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled", "type", "seriesMasterId", "iCalUId", "webLink"];
+                 }, cancellationToken);
+             }
+             else
+@@ -757,7 +757,7 @@
+                     config.QueryParameters.EndDateTime = end.ToString("yyyy-MM-ddTHH:mm:ssZ");
+                     config.QueryParameters.Top = count;
+                     config.QueryParameters.Orderby = ["start/dateTime"];
+-                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled"];
++                    config.QueryParameters.Select = ["id", "subject", "start", "end", "location", "body", "organizer", "attendees", "isAllDay", "responseStatus", "showAs", "isCancelled", "type", "seriesMasterId", "iCalUId", "webLink"];
+                 }, cancellationToken);
+             }
+ 
+@@ -781,7 +781,12 @@
+                         IsAllDay = evt.IsAllDay ?? false,
+                         ResponseStatus = MapResponseStatus(evt.ResponseStatus?.Response),
+                         ShowAs = MapShowAs(evt.ShowAs),
+-                        IsCancelled = evt.IsCancelled ?? false
++                        IsCancelled = evt.IsCancelled ?? false,
++                        IsRecurring = IsRecurringEvent(evt),
++                        EventType = MapEventType(evt.Type),
++                        SeriesMasterId = evt.SeriesMasterId,
++                        ICalUId = evt.ICalUId,
++                        WebLink = evt.WebLink
+                     });
+                 }
+             }
+@@ -821,7 +826,8 @@
+                         "id", "subject", "start", "end", "location", "body", "organizer", 
+                         "attendees", "isAllDay", "responseStatus", "showAs", "sensitivity",
+                         "isCancelled", "isOnlineMeeting", "onlineMeetingUrl", "onlineMeeting",
+-                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime"
++                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime",
++                        "type", "seriesMasterId", "iCalUId", "webLink"
+                     ];
+                 }, cancellationToken);
+             }
+@@ -833,7 +839,8 @@
+                         "id", "subject", "start", "end", "location", "body", "organizer", 
+                         "attendees", "isAllDay", "responseStatus", "showAs", "sensitivity",
+                         "isCancelled", "isOnlineMeeting", "onlineMeetingUrl", "onlineMeeting",
+-                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime"
++                        "recurrence", "categories", "importance", "createdDateTime", "lastModifiedDateTime",
++                        "type", "seriesMasterId", "iCalUId", "webLink"
+                     ];
+                 }, cancellationToken);
+             }
+@@ -875,7 +882,11 @@
+                 IsOnlineMeeting = evt.IsOnlineMeeting ?? false,
+                 OnlineMeetingUrl = evt.OnlineMeetingUrl ?? evt.OnlineMeeting?.JoinUrl,
+                 OnlineMeetingProvider = evt.IsOnlineMeeting == true ? "teamsForBusiness" : null,
+-                IsRecurring = evt.Recurrence != null,
++                IsRecurring = IsRecurringEvent(evt),
++                EventType = MapEventType(evt.Type),
++                SeriesMasterId = evt.SeriesMasterId,
++                ICalUId = evt.ICalUId,
++                WebLink = evt.WebLink,
+                 RecurrencePattern = FormatRecurrencePattern(evt.Recurrence),
+                 Categories = evt.Categories?.ToList() ?? [],
+                 Importance = MapImportance(evt.Importance),
+@@ -944,6 +955,20 @@
+             _ => "required"
+         };
+     }
++
++    private static bool IsRecurringEvent(Event evt) =>
++        evt.Type is EventType.Occurrence or EventType.Exception or EventType.SeriesMaster
++        || !string.IsNullOrEmpty(evt.SeriesMasterId)
++        || evt.Recurrence != null;
++
++    private static string? MapEventType(EventType? type) => type switch
++    {
++        EventType.SingleInstance => "singleInstance",
++        EventType.Occurrence => "occurrence",
++        EventType.Exception => "exception",
++        EventType.SeriesMaster => "seriesMaster",
++        _ => null
++    };
+ 
+     private static string MapShowAs(FreeBusyStatus? showAs)
+     {
+diff --git a/src/CalendarMcp.Core/Tools/GetCalendarEventDetailsTool.cs b/src/CalendarMcp.Core/Tools/GetCalendarEventDetailsTool.cs
+--- a/src/CalendarMcp.Core/Tools/GetCalendarEventDetailsTool.cs
++++ b/src/CalendarMcp.Core/Tools/GetCalendarEventDetailsTool.cs
+@@ -19,7 +19,7 @@
+     IProviderServiceFactory providerFactory,
+     ILogger<GetCalendarEventDetailsTool> logger)
+ {
+-    [McpServerTool, Description("Get full details for a single calendar event including attendee responses, free/busy status, recurrence pattern, and online meeting link. Use this after get_calendar_events to fetch richer data for a specific event.")]
++    [McpServerTool, Description("Get full details for a single calendar event including provider free/busy status, eventType, seriesMasterId, recurrence pattern, iCalUId, and webLink. For an occurrence or exception, use its seriesMasterId with this same tool to inspect the series separately; do not replace an occurrence's showAs with the series value. Use webLink to compare the exact event in Outlook.")]
+     public async Task<string> GetCalendarEventDetails(
+         [Description("IANA timezone name for displaying event times (e.g. `America/Chicago`, `America/New_York`, `Europe/London`, `Asia/Tokyo`). All event times are returned in both UTC and this local timezone.")] string timeZone,
+         [Description("Account ID from get_calendar_events")] string accountId,
+@@ -85,6 +85,10 @@
+                 onlineMeetingUrl = evt.OnlineMeetingUrl,
+                 onlineMeetingProvider = evt.OnlineMeetingProvider,
+                 isRecurring = evt.IsRecurring,
++                eventType = evt.EventType,
++                seriesMasterId = evt.SeriesMasterId,
++                iCalUId = evt.ICalUId,
++                webLink = evt.WebLink,
+                 recurrencePattern = evt.RecurrencePattern,
+                 categories = evt.Categories,
+                 importance = evt.Importance,
+diff --git a/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs b/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
+--- a/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
++++ b/src/CalendarMcp.Core/Tools/GetCalendarEventsTool.cs
+@@ -214,6 +214,11 @@
+                     location = e.Location,
+                     attendees = e.Attendees,
+                     isAllDay = e.IsAllDay,
++                    isRecurring = e.IsRecurring,
++                    eventType = e.EventType,
++                    seriesMasterId = e.SeriesMasterId,
++                    iCalUId = e.ICalUId,
++                    webLink = e.WebLink,
+                     showAs = e.ShowAs,
+                     isCancelled = e.IsCancelled,
+                     responseStatus = e.ResponseStatus,
+diff --git a/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs b/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs
+--- a/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs
++++ b/src/CalendarMcp.Tests/Providers/GraphCalendarAvailabilityTests.cs
+@@ -17,11 +17,31 @@
+ public sealed class GraphCalendarAvailabilityTests
+ {
+     [TestMethod]
+-    [DataRow("microsoft365", "primary")]
+-    [DataRow("microsoft365", "named-calendar")]
+-    [DataRow("outlook.com", "primary")]
+-    [DataRow("outlook.com", "named-calendar")]
+-    public async Task ListAndDetailPreserveAvailabilityFromGraph(string providerName, string calendarId)
++    [DataRow("microsoft365", "primary", "singleInstance")]
++    [DataRow("microsoft365", "primary", "occurrence")]
++    [DataRow("microsoft365", "primary", "exception")]
++    [DataRow("microsoft365", "primary", "seriesMaster")]
++    [DataRow("microsoft365", "primary", "missingTypeWithMaster")]
++    [DataRow("microsoft365", "primary", "missingType")]
++    [DataRow("microsoft365", "named-calendar", "singleInstance")]
++    [DataRow("microsoft365", "named-calendar", "occurrence")]
++    [DataRow("microsoft365", "named-calendar", "exception")]
++    [DataRow("microsoft365", "named-calendar", "seriesMaster")]
++    [DataRow("microsoft365", "named-calendar", "missingTypeWithMaster")]
++    [DataRow("microsoft365", "named-calendar", "missingType")]
++    [DataRow("outlook.com", "primary", "singleInstance")]
++    [DataRow("outlook.com", "primary", "occurrence")]
++    [DataRow("outlook.com", "primary", "exception")]
++    [DataRow("outlook.com", "primary", "seriesMaster")]
++    [DataRow("outlook.com", "primary", "missingTypeWithMaster")]
++    [DataRow("outlook.com", "primary", "missingType")]
++    [DataRow("outlook.com", "named-calendar", "singleInstance")]
++    [DataRow("outlook.com", "named-calendar", "occurrence")]
++    [DataRow("outlook.com", "named-calendar", "exception")]
++    [DataRow("outlook.com", "named-calendar", "seriesMaster")]
++    [DataRow("outlook.com", "named-calendar", "missingTypeWithMaster")]
++    [DataRow("outlook.com", "named-calendar", "missingType")]
++    public async Task ListAndDetailPreserveAvailabilityFromGraph(string providerName, string calendarId, string eventKind)
+     {
+         (string? GraphValue, string Expected)[] cases =
+         [
+@@ -41,7 +61,7 @@
+             auth.Setups.GetTokenSilentlyAsync("test-tenant", "test-client", Arg.Any<string[]>(),
+                     account.Id, Arg.Any<CancellationToken>())
+                 .ReturnValue(Task.FromResult<string?>("unit-test-token")).ExpectedCallCount(2);
+-            using var handler = new CalendarHandler(graphValue);
++            using var handler = new CalendarHandler(graphValue, eventKind);
+             using var http = new HttpClient(handler);
+             using var graph = new GraphServiceClient(http, new AnonymousAuthenticationProvider());
+             IProviderService provider = providerName == "microsoft365"
+@@ -59,6 +79,13 @@
+             foreach (var item in new[] { events[0], detail })
+             {
+                 Assert.AreEqual(expected, item.ShowAs, "Provider availability must survive mapping");
++                Assert.AreEqual(eventKind is not ("singleInstance" or "missingType"), item.IsRecurring,
++                    "Occurrences and exceptions remain recurring even when Graph recurrence is null");
++                Assert.AreEqual(eventKind.StartsWith("missingType") ? null : eventKind, item.EventType);
++                Assert.AreEqual(eventKind is "occurrence" or "exception" or "missingTypeWithMaster" ? "series-master" : null,
++                    item.SeriesMasterId);
++                Assert.AreEqual("occurrence-uid", item.ICalUId);
++                Assert.AreEqual("https://outlook.live.com/calendar/item/exact-event", item.WebLink);
+                 Assert.IsTrue(item.IsAllDay);
+                 Assert.IsTrue(item.IsCancelled, "Cancellation must survive list and detail reads");
+                 Assert.AreEqual("declined", item.ResponseStatus);
+@@ -69,7 +96,7 @@
+         }
+     }
+ 
+-    private sealed class CalendarHandler(string? showAs) : HttpMessageHandler
++    private sealed class CalendarHandler(string? showAs, string eventKind) : HttpMessageHandler
+     {
+         public int Requests { get; private set; }
+ 
+@@ -79,7 +106,7 @@
+             Requests++;
+             var uri = request.RequestUri!;
+             var fields = HttpUtility.ParseQueryString(uri.Query)["$select"]?.Split(',') ?? [];
+-            foreach (var required in new[] { "showAs", "isCancelled", "responseStatus" })
++            foreach (var required in new[] { "showAs", "isCancelled", "responseStatus", "type", "seriesMasterId", "iCalUId", "webLink" })
+                 Assert.IsTrue(fields.Contains(required), $"Graph request must select {required}");
+ 
+             var evt = new Dictionary<string, object?>
+@@ -88,6 +115,11 @@
+                 ["start"] = new { dateTime = "2026-11-05T00:00:00", timeZone = "UTC" },
+                 ["end"] = new { dateTime = "2026-11-06T00:00:00", timeZone = "UTC" },
+                 ["isAllDay"] = true, ["isCancelled"] = true,
++                ["type"] = eventKind.StartsWith("missingType") ? null : eventKind,
++                ["seriesMasterId"] = eventKind is "occurrence" or "exception" or "missingTypeWithMaster" ? "series-master" : null,
++                ["recurrence"] = null,
++                ["iCalUId"] = "occurrence-uid",
++                ["webLink"] = "https://outlook.live.com/calendar/item/exact-event",
+                 ["responseStatus"] = new { response = "declined" }
+             };
+             if (showAs != null)
+diff --git a/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs b/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs
+--- a/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs
++++ b/src/CalendarMcp.Tests/Tools/CalendarAvailabilityOutputTests.cs
+@@ -27,7 +27,9 @@
+             Id = "workout", AccountId = account.Id, CalendarId = "primary", Subject = "Workout",
+             Start = new DateTimeOffset(2026, 11, 5, 0, 0, 0, TimeSpan.Zero),
+             End = new DateTimeOffset(2026, 11, 6, 0, 0, 0, TimeSpan.Zero),
+-            IsAllDay = true, ShowAs = showAs, IsCancelled = cancelled, ResponseStatus = "declined"
++            IsAllDay = true, ShowAs = showAs, IsCancelled = cancelled, ResponseStatus = "declined",
++            IsRecurring = true, EventType = "exception", SeriesMasterId = "series-master",
++            ICalUId = "occurrence-uid", WebLink = "https://outlook.live.com/calendar/item/exact-event"
+         };
+         var registry = new IAccountRegistryCreateExpectations();
+         registry.Setups.GetAccountAsync(account.Id)
+@@ -58,6 +60,11 @@
+             Assert.AreEqual(cancelled, item.GetProperty("isCancelled").GetBoolean());
+             Assert.AreEqual("declined", item.GetProperty("responseStatus").GetString());
+             Assert.IsTrue(item.GetProperty("isAllDay").GetBoolean());
++            Assert.IsTrue(item.GetProperty("isRecurring").GetBoolean());
++            Assert.AreEqual("exception", item.GetProperty("eventType").GetString());
++            Assert.AreEqual("series-master", item.GetProperty("seriesMasterId").GetString());
++            Assert.AreEqual("occurrence-uid", item.GetProperty("iCalUId").GetString());
++            Assert.AreEqual(evt.WebLink, item.GetProperty("webLink").GetString());
+         }
+         registry.Verify();
+         provider.Verify();

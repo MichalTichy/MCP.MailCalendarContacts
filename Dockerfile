@@ -19,6 +19,7 @@ COPY patches/agent-file-http-transfer.patch /tmp/agent-file-http-transfer.patch
 COPY patches/attach-to-draft.patch /tmp/attach-to-draft.patch
 COPY patches/signature-text-format.patch /tmp/signature-text-format.patch
 COPY patches/calendar-availability.patch /tmp/calendar-availability.patch
+COPY patches/calendar-series-metadata.patch /tmp/calendar-series-metadata.patch
 RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check - \
     && apt-get update \
     && apt-get install --yes --no-install-recommends patch \
@@ -36,6 +37,7 @@ RUN echo "${ADJUTANT_SOURCE_SHA256}  /tmp/adjutant.tar.gz" | sha256sum --check -
     && patch --directory /source --strip=1 < /tmp/attach-to-draft.patch \
     && patch --directory /source --strip=1 < /tmp/signature-text-format.patch \
     && patch --directory /source --strip=1 < /tmp/calendar-availability.patch \
+    && patch --directory /source --strip=1 < /tmp/calendar-series-metadata.patch \
     && dotnet publish /source/src/CalendarMcp.HttpServer/CalendarMcp.HttpServer.csproj \
         --configuration Release \
         --output /app/publish \

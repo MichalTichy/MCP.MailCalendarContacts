@@ -19,6 +19,7 @@ The server supports multiple Microsoft 365, Outlook.com, Google, IMAP/SMTP, ICS,
 - The UI binds to loopback by default, and the container joins the gateway backend network rather than its runner network.
 - Calendar create/update normalizes offset-aware input into the requested calendar time zone before writing, while preserving offset-free local times.
 - Calendar list and detail reads expose `showAs`, `isCancelled`, and `responseStatus`. Microsoft 365/Outlook.com availability and Google transparency survive list mapping; missing Microsoft availability is `unknown`, never an invented `busy`. Free and cancelled entries do not block scheduling, including all-day entries.
+- Microsoft calendar reads also expose `eventType`, `seriesMasterId`, `iCalUId`, and `webLink`. Occurrences and exceptions remain recurring even when Graph returns no recurrence pattern. To investigate a Show as discrepancy, open the exact event link and read the returned series master ID separately; a series-level status must not overwrite an individual exception's status.
 
 Codex Gateway provides the tool-authorization layer: each API key/project grant selects exact MCP tools, and its run-scoped relay rejects calls to tools outside that selection.
 
